@@ -73,6 +73,7 @@ PG_MODULE_MAGIC;
 
 static planner_hook_type next_planner_hook = NULL;
 static create_upper_paths_hook_type next_create_upper_paths_hook = NULL;
+static set_rel_pathlist_hook_type next_set_rel_pathlist_hook = NULL;
 static set_join_pathlist_hook_type next_set_join_pathlist_hook = NULL;
 static bool pg_monetdb_enable_planner_hook_debug = false;
 static int pg_monetdb_trace_active_depth = 0;
@@ -91,6 +92,10 @@ static void pg_monetdb_create_upper_paths(PlannerInfo *root,
 									 RelOptInfo *input_rel,
 									 RelOptInfo *output_rel,
 									 void *extra);
+static void pg_monetdb_set_rel_pathlist(PlannerInfo *root,
+								RelOptInfo *rel,
+								Index rti,
+								RangeTblEntry *rte);
 static void pg_monetdb_set_join_pathlist(PlannerInfo *root,
 									 RelOptInfo *joinrel,
 									 RelOptInfo *outerrel,
@@ -100,6 +105,10 @@ static void pg_monetdb_set_join_pathlist(PlannerInfo *root,
 static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 										 const char *query_string);
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
+static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
+										 Oid *relid_out);
+static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
+									   Oid relid);
 static void pg_monetdb_log_query_shape(Query *query, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
@@ -204,6 +213,8 @@ _PG_init(void)
 	planner_hook = pg_monetdb_planner;
 	next_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = pg_monetdb_create_upper_paths;
+	next_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = pg_monetdb_set_rel_pathlist;
 	next_set_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = pg_monetdb_set_join_pathlist;
 }
@@ -215,6 +226,8 @@ _PG_fini(void)
 		planner_hook = next_planner_hook;
 	if (create_upper_paths_hook == pg_monetdb_create_upper_paths)
 		create_upper_paths_hook = next_create_upper_paths_hook;
+	if (set_rel_pathlist_hook == pg_monetdb_set_rel_pathlist)
+		set_rel_pathlist_hook = next_set_rel_pathlist_hook;
 	if (set_join_pathlist_hook == pg_monetdb_set_join_pathlist)
 		set_join_pathlist_hook = next_set_join_pathlist_hook;
 }
@@ -297,12 +310,111 @@ pg_monetdb_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 }
 
 static void
+pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+					Index rti, RangeTblEntry *rte)
+{
+	Oid			derived_relid = InvalidOid;
+
+	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
+		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
+		pg_monetdb_attach_grouped_subquery_fpinfo(rel, derived_relid);
+
+	if (pg_monetdb_enable_planner_hook_debug &&
+		root != NULL && root->parse != NULL &&
+		rte != NULL)
+	{
+		const char *relname = NULL;
+
+		if (rte->rtekind == RTE_RELATION)
+			relname = get_rel_name(rte->relid);
+
+		elog(DEBUG1,
+			 "pg_monetdb rel hook: rti=%u rtekind=%s reloptkind=%d relid=%u relname=%s fdw_private=%s relids=%s",
+			 rti,
+			 pg_monetdb_rtekind_name(rte->rtekind),
+			 rel != NULL ? rel->reloptkind : -1,
+			 rte->relid,
+			 relname != NULL ? relname : "<none>",
+			 rel != NULL && rel->fdw_private != NULL ? "true" : "false",
+			 rel != NULL && rel->relids != NULL ? bmsToString(rel->relids) : "<null>");
+	}
+
+	if (next_set_rel_pathlist_hook)
+		next_set_rel_pathlist_hook(root, rel, rti, rte);
+}
+
+static bool
+pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out)
+{
+	Query	   *subquery;
+	RangeTblEntry *base_rte;
+	Node	   *fromnode;
+
+	if (relid_out != NULL)
+		*relid_out = InvalidOid;
+
+	if (rte == NULL || rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+		return false;
+
+	subquery = rte->subquery;
+	if (!subquery->hasAggs || subquery->groupClause == NIL ||
+		list_length(subquery->rtable) != 2 || subquery->hasSubLinks)
+		return false;
+
+	if (subquery->jointree == NULL || list_length(subquery->jointree->fromlist) != 1)
+		return false;
+
+	fromnode = linitial(subquery->jointree->fromlist);
+	if (!IsA(fromnode, RangeTblRef) || ((RangeTblRef *) fromnode)->rtindex != 1)
+		return false;
+
+	base_rte = rt_fetch(1, subquery->rtable);
+	if (base_rte->rtekind != RTE_RELATION ||
+		get_rel_relkind(base_rte->relid) != RELKIND_FOREIGN_TABLE)
+		return false;
+
+	if (relid_out != NULL)
+		*relid_out = base_rte->relid;
+
+	return true;
+}
+
+static void
+pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Oid relid)
+{
+	ForeignTable *table;
+	ForeignServer *server;
+	UserMapping *user;
+	MonetdbFdwRelationInfo *fpinfo;
+
+	if (rel == NULL || relid == InvalidOid)
+		return;
+
+	table = GetForeignTable(relid);
+	server = GetForeignServer(table->serverid);
+	user = GetUserMapping(GetUserId(), table->serverid);
+
+	fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
+	fpinfo->pushdown_safe = true;
+	fpinfo->stage = UPPERREL_GROUP_AGG;
+	fpinfo->table = table;
+	fpinfo->server = server;
+	fpinfo->user = user;
+	fpinfo->relation_name = psprintf("Grouped subquery on (%s)",
+						 get_rel_name(relid));
+	fpinfo->retrieved_rows = -1;
+	fpinfo->rel_startup_cost = -1;
+	fpinfo->rel_total_cost = -1;
+
+	rel->fdw_private = fpinfo;
+}
+
+static void
 pg_monetdb_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 					 RelOptInfo *outerrel, RelOptInfo *innerrel,
 					 JoinType jointype, JoinPathExtraData *extra)
 {
 	if (pg_monetdb_enable_planner_hook_debug &&
-		pg_monetdb_trace_active_depth > 0 &&
 		root != NULL && root->parse != NULL)
 	{
 		elog(DEBUG1,
