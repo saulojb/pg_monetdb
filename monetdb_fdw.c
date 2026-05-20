@@ -44,6 +44,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
@@ -65,7 +66,20 @@
 /* Forward declaration for ExplainState - defined in commands/explain_state.h */
 typedef struct ExplainState ExplainState;
 
+void		_PG_init(void);
+void		_PG_fini(void);
+
 PG_MODULE_MAGIC;
+
+static planner_hook_type next_planner_hook = NULL;
+static bool pg_monetdb_enable_planner_hook_debug = false;
+
+static PlannedStmt *pg_monetdb_planner(Query *parse,
+									  const char *query_string,
+									  int cursorOptions,
+									  ParamListInfo boundParams);
+static bool pg_monetdb_query_needs_planner_trace(Query *parse,
+										 const char *query_string);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
@@ -145,6 +159,69 @@ enum FdwDirectModifyPrivateIndex
 	/* set-processed flag (as a Boolean node) */
 	FdwDirectModifyPrivateSetProcessed
 };
+
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("pg_monetdb.enable_planner_hook_debug",
+							 "Emit DEBUG1 traces from the pg_monetdb planner hook scaffold.",
+							 NULL,
+							 &pg_monetdb_enable_planner_hook_debug,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	EmitWarningsOnPlaceholders("pg_monetdb");
+
+	next_planner_hook = planner_hook;
+	planner_hook = pg_monetdb_planner;
+}
+
+void
+_PG_fini(void)
+{
+	if (planner_hook == pg_monetdb_planner)
+		planner_hook = next_planner_hook;
+}
+
+static PlannedStmt *
+pg_monetdb_planner(Query *parse, const char *query_string,
+				   int cursorOptions, ParamListInfo boundParams)
+{
+	if (pg_monetdb_enable_planner_hook_debug &&
+		pg_monetdb_query_needs_planner_trace(parse, query_string))
+	{
+		elog(DEBUG1,
+			 "pg_monetdb planner hook reached: hasSubLinks=%s hasAggs=%s commandType=%d",
+			 parse->hasSubLinks ? "true" : "false",
+			 parse->hasAggs ? "true" : "false",
+			 parse->commandType);
+	}
+
+	if (next_planner_hook)
+		return next_planner_hook(parse, query_string, cursorOptions, boundParams);
+
+	return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
+static bool
+pg_monetdb_query_needs_planner_trace(Query *parse, const char *query_string)
+{
+	if (parse->hasSubLinks && parse->hasAggs)
+		return true;
+
+	if (query_string == NULL)
+		return false;
+
+	if (strstr(query_string, "l_orderkey") != NULL &&
+		strstr(query_string, "sum(l_quantity)") != NULL)
+		return true;
+
+	return false;
+}
 
 /*
  * Execution state of a foreign scan using monetdb_fdw.
