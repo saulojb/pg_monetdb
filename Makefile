@@ -10,8 +10,26 @@ OBJS = \
 
 PGFILEDESC = "MonetDB_fdw - foreign data wrapper for MonetDB"
 
-PG_CPPFLAGS += -I"$(MONETDB_HOME)/include/monetdb/"
-SHLIB_LINK_INTERNAL = -L"$(MONETDB_HOME)/lib" -lmapi-11.56.0
+# MonetDB installation paths.
+# Override MONETDB_HOME to point at a non-standard installation, e.g.:
+#   make MONETDB_HOME=/opt/monetdb USE_PGXS=1
+MONETDB_HOME ?= /usr
+MONETDB_INCLUDE ?= $(MONETDB_HOME)/include/monetdb
+MONETDB_LIB    ?= $(MONETDB_HOME)/lib/x86_64-linux-gnu
+
+# Locate the versioned libmapi shared library at build time so we don't
+# have to hard-code the version string.
+MAPI_LIB := $(firstword $(wildcard $(MONETDB_LIB)/libmapi-*.so) \
+                         $(wildcard $(MONETDB_HOME)/lib/libmapi-*.so))
+ifeq ($(MAPI_LIB),)
+  $(error Cannot find libmapi shared library under $(MONETDB_LIB). \
+          Set MONETDB_HOME or MONETDB_LIB explicitly.)
+endif
+MAPI_LIBNAME := $(patsubst lib%.so,%,$(notdir $(MAPI_LIB)))
+MAPI_LIBDIR  := $(dir $(MAPI_LIB))
+
+PG_CPPFLAGS  += -I"$(MONETDB_INCLUDE)"
+SHLIB_LINK   += -L"$(MAPI_LIBDIR)" -l"$(MAPI_LIBNAME)" -Wl,-rpath,"$(MAPI_LIBDIR)"
 
 EXTENSION = monetdb_fdw
 DATA = monetdb_fdw--1.0.sql

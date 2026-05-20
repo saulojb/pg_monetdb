@@ -1,0 +1,16 @@
+CREATE OR REPLACE FUNCTION to_date(date_string VARCHAR, format_string VARCHAR) 
+RETURNS DATE 
+BEGIN
+    DECLARE monetdb_format VARCHAR;
+    
+    -- Translate PostgreSQL format tokens to MonetDB strptime tokens
+    SET monetdb_format = REPLACE(format_string, 'YYYY', '%Y');
+    SET monetdb_format = REPLACE(monetdb_format, 'MM', '%m');
+    SET monetdb_format = REPLACE(monetdb_format, 'DD', '%d');
+    SET monetdb_format = REPLACE(monetdb_format, 'HH', '%H');
+    SET monetdb_format = REPLACE(monetdb_format, 'MI', '%M');
+    SET monetdb_format = REPLACE(monetdb_format, 'SS', '%S');
+    
+    -- Use MonetDB's str_to_date and cast the result to DATE
+    RETURN CAST(str_to_date(date_string, monetdb_format) AS DATE);
+END;

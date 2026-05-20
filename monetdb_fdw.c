@@ -27,6 +27,9 @@
 #include "catalog/pg_foreign_server.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#endif
 #include "commands/vacuum.h"
 #include "executor/execAsync.h"
 #include "foreign/fdwapi.h"
@@ -164,6 +167,7 @@ typedef struct MonetdbFdwScanState
 	FmgrInfo   *param_flinfo;	/* output conversion functions for them */
 	List	   *param_exprs;	/* executable expressions for param values */
 	const char **param_values;	/* textual values of query parameters */
+	Oid		   *param_types;	/* type OIDs of query parameters */
 
 	/* for storing result tuples */
 	HeapTuple  *tuples;			/* array of currently-retrieved tuples */
@@ -223,6 +227,31 @@ typedef struct MonetdbFdwModifyState
 } MonetdbFdwModifyState;
 
 /*
+ * Execution state of a direct foreign table modification (UPDATE/DELETE
+ * pushed entirely to MonetDB as a single SQL statement).
+ */
+typedef struct MonetdbFdwDirectModifyState
+{
+	Relation	rel;			/* relcache entry for the foreign table */
+
+	/* for remote query execution */
+	Mapi		conn;			/* connection */
+	MapiHdl		hdl;			/* query handle */
+
+	/* extracted fdw_private data */
+	char	   *query;			/* text of UPDATE/DELETE command */
+	bool		has_returning;	/* is there a RETURNING clause? */
+	List	   *retrieved_attrs;	/* attr numbers retrieved by RETURNING */
+	bool		set_processed;	/* should we set command es_processed? */
+
+	/* execution state */
+	int64		num_tuples;		/* # of rows affected; -1 = not yet executed */
+
+	/* working memory context */
+	MemoryContext temp_cxt;
+} MonetdbFdwDirectModifyState;
+
+/*
  * This enum describes what's kept in the fdw_private list for a ForeignPath.
  * We store:
  *
@@ -280,6 +309,7 @@ static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 static void MonetDB_GetForeignPaths(PlannerInfo *root,
 									RelOptInfo *baserel,
 									Oid foreigntableid);
+static bool monetdb_subplan_is_inlineable(Node *expr, PlannerInfo *root);
 static ForeignScan *MonetDB_GetForeignPlan(PlannerInfo *root,
 										   RelOptInfo *foreignrel,
 										   Oid foreigntableid,
@@ -313,6 +343,7 @@ static TupleTableSlot **MonetDB_ExecForeignBatchInsert(EState *estate,
 													   TupleTableSlot **slots,
 													   TupleTableSlot **planSlots,
 													   int *numSlots);
+static int	MonetDB_GetForeignModifyBatchSize(ResultRelInfo *resultRelInfo);
 static TupleTableSlot *MonetDB_ExecForeignUpdate(EState *estate,
 												 ResultRelInfo *resultRelInfo,
 												 TupleTableSlot *slot,
@@ -328,6 +359,14 @@ static void MonetDB_BeginForeignInsert(ModifyTableState *mtstate,
 static void MonetDB_EndForeignInsert(EState *estate,
 									 ResultRelInfo *resultRelInfo);
 static int	MonetDB_IsForeignRelUpdatable(Relation rel);
+static ForeignScan *find_modifytable_subplan(PlannerInfo *root,
+											 ModifyTable *plan,
+											 Index rtindex,
+											 int subplan_index);
+static bool MonetDB_PlanDirectModify(PlannerInfo *root,
+									 ModifyTable *plan,
+									 Index resultRelation,
+									 int subplan_index);
 static void MonetDB_BeginDirectModify(ForeignScanState *node, int eflags);
 static TupleTableSlot *MonetDB_IterateDirectModify(ForeignScanState *node);
 static void MonetDB_EndDirectModify(ForeignScanState *node);
@@ -392,7 +431,14 @@ static void prepare_query_params(PlanState *node,
 								 int numParams,
 								 FmgrInfo **param_flinfo,
 								 List **param_exprs,
-								 const char ***param_values);
+								 const char ***param_values,
+								 Oid **param_types);
+static char *build_parameterized_query(const char *query_template,
+									   int numParams,
+									   FmgrInfo *param_flinfo,
+									   Oid *param_types,
+									   List *param_exprs,
+									   ExprContext *econtext);
 static HeapTuple make_tuple_from_result_row(MapiHdl res,
 											int row,
 											Relation rel,
@@ -470,14 +516,14 @@ monetdb_fdw_handler(PG_FUNCTION_ARGS)
 	routine->BeginForeignModify = MonetDB_BeginForeignModify;
 	routine->ExecForeignInsert = MonetDB_ExecForeignInsert;
 	routine->ExecForeignBatchInsert = MonetDB_ExecForeignBatchInsert;
-	routine->GetForeignModifyBatchSize = NULL;
+	routine->GetForeignModifyBatchSize = MonetDB_GetForeignModifyBatchSize;
 	routine->ExecForeignUpdate = MonetDB_ExecForeignUpdate;
 	routine->ExecForeignDelete = MonetDB_ExecForeignDelete;
 	routine->EndForeignModify = MonetDB_EndForeignModify;
 	routine->BeginForeignInsert = MonetDB_BeginForeignInsert;
 	routine->EndForeignInsert = MonetDB_EndForeignInsert;
 	routine->IsForeignRelUpdatable = MonetDB_IsForeignRelUpdatable;
-	routine->PlanDirectModify = NULL;
+	routine->PlanDirectModify = MonetDB_PlanDirectModify;
 	routine->BeginDirectModify = MonetDB_BeginDirectModify;
 	routine->IterateDirectModify = MonetDB_IterateDirectModify;
 	routine->EndDirectModify = MonetDB_EndDirectModify;
@@ -1125,6 +1171,64 @@ MonetDB_GetForeignPaths(PlannerInfo *root,
 }
 
 /*
+ * monetdb_subplan_is_inlineable
+ *
+ * Returns true if every SubPlan node embedded in 'expr' is an EXPR_SUBLINK
+ * whose inner plan is already a ForeignScan (i.e., it was already pushed to
+ * the same MonetDB server as the outer relation).  Such SubPlans can be
+ * inlined into the outer SQL as correlated subqueries by deparseSubPlan().
+ */
+typedef struct
+{
+	PlannerInfo *root;
+	bool		ok;
+} SubPlanInlineCtx;
+
+static bool
+subplan_inline_walker(Node *node, SubPlanInlineCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubPlan))
+	{
+		SubPlan    *sp = (SubPlan *) node;
+		Plan	   *inner;
+
+		if (sp->subLinkType != EXPR_SUBLINK)
+		{
+			ctx->ok = false;
+			return true;		/* stop walking */
+		}
+		if (sp->plan_id < 1 ||
+			sp->plan_id > list_length(ctx->root->glob->subplans))
+		{
+			ctx->ok = false;
+			return true;
+		}
+		inner = (Plan *) list_nth(ctx->root->glob->subplans,
+								  sp->plan_id - 1);
+		if (!IsA(inner, ForeignScan))
+		{
+			ctx->ok = false;
+			return true;
+		}
+		return false;			/* keep walking for any nested SubPlans */
+	}
+	return expression_tree_walker(node, subplan_inline_walker, ctx);
+}
+
+static bool
+monetdb_subplan_is_inlineable(Node *expr, PlannerInfo *root)
+{
+	SubPlanInlineCtx ctx;
+
+	ctx.root = root;
+	ctx.ok = true;
+	(void) subplan_inline_walker(expr, &ctx);
+	return ctx.ok;
+}
+
+/*
  * MonetDB_GetForeignPlan
  *		Create ForeignScan plan node which implements selected best path
  */
@@ -1239,6 +1343,52 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 		 */
 		remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
 		local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
+
+		/*
+		 * For any local conditions that contain scalar SubPlan expressions
+		 * whose inner plan is a ForeignScan on the same MonetDB server,
+		 * inline them into the remote SQL as correlated subqueries.  This
+		 * eliminates all per-row round-trip cost: MonetDB applies the filter
+		 * itself, so we drop the condition from local_exprs entirely.
+		 */
+		{
+			ListCell   *lc2;
+			List	   *new_local_exprs = NIL;
+
+			foreach(lc2, local_exprs)
+			{
+				Node	   *expr = (Node *) lfirst(lc2);
+
+				if (contain_subplans(expr) &&
+					monetdb_subplan_is_inlineable(expr, root))
+					remote_exprs = lappend(remote_exprs, expr);
+				else
+					new_local_exprs = lappend(new_local_exprs, expr);
+			}
+			local_exprs = new_local_exprs;
+		}
+
+		/*
+		 * Also remove inlined SubPlan conditions from fpinfo->local_conds so
+		 * that build_tlist_to_deparse() does not pull the SubPlan's outer Vars
+		 * (e.g. l_quantity, p_partkey) into fdw_scan_tlist.  Those columns are
+		 * only needed for the local filter, which we have now pushed to MonetDB.
+		 */
+		{
+			List	   *new_local_conds = NIL;
+			ListCell   *lc3;
+
+			foreach(lc3, fpinfo->local_conds)
+			{
+				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc3);
+
+				if (contain_subplans((Node *) rinfo->clause) &&
+					monetdb_subplan_is_inlineable((Node *) rinfo->clause, root))
+					continue;	/* inlined into remote SQL */
+				new_local_conds = lappend(new_local_conds, rinfo);
+			}
+			fpinfo->local_conds = new_local_conds;
+		}
 
 		/*
 		 * We leave fdw_recheck_quals empty in this case, since we never need
@@ -1499,7 +1649,8 @@ MonetDB_BeginForeignScan(ForeignScanState *node, int eflags)
 							 numParams,
 							 &fsstate->param_flinfo,
 							 &fsstate->param_exprs,
-							 &fsstate->param_values);
+							 &fsstate->param_values,
+							 &fsstate->param_types);
 
 	/* Set the async-capable flag */
 	fsstate->async_capable = node->ss.ps.async_capable;
@@ -1518,10 +1669,27 @@ MonetDB_IterateForeignScan(ForeignScanState *node)
 
 	if (!fsstate->hdl)
 	{
-		elog(DEBUG2, "monetdb_fdw remote query is: %s", fsstate->query);
+		const char *sql;
+
+		/*
+		 * If the query has runtime parameters (e.g. from a parameterized
+		 * nested-loop join), substitute their current values into the SQL
+		 * template now, since MAPI does not support server-side parameter
+		 * binding.
+		 */
+		if (fsstate->numParams > 0)
+			sql = build_parameterized_query(fsstate->query,
+											fsstate->numParams,
+											fsstate->param_flinfo,
+											fsstate->param_types,
+											fsstate->param_exprs,
+											node->ss.ps.ps_ExprContext);
+		else
+			sql = fsstate->query;
+
 		/* Submit a query and wait for the result. */
-		if ((fsstate->hdl = mapi_query(fsstate->conn, fsstate->query)) == NULL ||
-			mapi_error(fsstate->conn) != MOK)
+		fsstate->hdl = mapi_query(fsstate->conn, sql);
+		if (fsstate->hdl == NULL || mapi_error(fsstate->conn) != MOK)
 		{
 			if (mapi_error(fsstate->conn))
 				die(fsstate->conn, fsstate->hdl);
@@ -1558,12 +1726,35 @@ MonetDB_IterateForeignScan(ForeignScanState *node)
 
 /*
  * MonetDB_ReScanForeignScan
- *		Restart the scan.
+ *		Restart the scan from the beginning, possibly with new parameters.
+ *
+ * Called when an upper node needs to re-execute the scan (e.g. a nested-loop
+ * join that passes a new outer-relation parameter value for each outer row).
+ * We close the existing query handle so that IterateForeignScan will open a
+ * fresh one (with the newly evaluated parameter values).
  */
 static void
 MonetDB_ReScanForeignScan(ForeignScanState *node)
 {
-	elog(ERROR, "MonetDB_ReScanForeignScan not supported yet");
+	MonetdbFdwScanState *fsstate = (MonetdbFdwScanState *) node->fdw_state;
+
+	/* If we haven't executed the query yet, nothing to reset. */
+	if (!fsstate->hdl)
+		return;
+
+	/* Close the current result handle. */
+	if (mapi_close_handle(fsstate->hdl) != MOK)
+		die(fsstate->conn, fsstate->hdl);
+	fsstate->hdl = NULL;
+
+	/* Clear the cached tuple batch so IterateForeignScan fetches fresh data. */
+	fsstate->tuples = NULL;
+	fsstate->num_tuples = 0;
+	fsstate->next_tuple = 0;
+	fsstate->fetch_ct_2 = 0;
+	fsstate->eof_reached = false;
+
+	MemoryContextReset(fsstate->batch_cxt);
 }
 
 /*
@@ -1870,7 +2061,10 @@ MonetDB_ExecForeignInsert(EState *estate,
 
 /*
  * MonetDB_ExecForeignBatchInsert
- *		Insert multiple rows into a foreign table
+ *		Insert multiple rows into a foreign table in one round-trip.
+ *
+ * Builds INSERT INTO table (cols) VALUES (?,DEFAULT,...), (?,DEFAULT,...), ...
+ * with one VALUES row per slot, using MAPI '?' placeholders (not $N).
  */
 static TupleTableSlot **
 MonetDB_ExecForeignBatchInsert(EState *estate,
@@ -1879,7 +2073,102 @@ MonetDB_ExecForeignBatchInsert(EState *estate,
 							   TupleTableSlot **planSlots,
 							   int *numSlots)
 {
-	elog(ERROR, "MonetDB_ExecForeignBatchInsert not supported yet");
+	MonetdbFdwModifyState *fmstate =
+		(MonetdbFdwModifyState *) resultRelInfo->ri_FdwState;
+	StringInfoData		sql;
+	MapiHdl				result;
+	const char		  **p_values;
+	int					n_rows;
+	int					total_params;
+	int					i;
+
+	Assert(fmstate != NULL);
+	Assert(*numSlots >= 1);
+
+	/*
+	 * Build INSERT INTO table (cols) VALUES (?,DEFAULT,...), ...
+	 *
+	 * orig_query already contains the complete first-row fragment up to
+	 * values_end: "INSERT INTO sys.t (c1,c2) VALUES (?,?)".
+	 * Append one additional VALUES row per extra slot.
+	 */
+	initStringInfo(&sql);
+	appendBinaryStringInfo(&sql, fmstate->orig_query, fmstate->values_end);
+
+	if (*numSlots > 1)
+	{
+		TupleDesc	tupdesc = RelationGetDescr(fmstate->rel);
+		ListCell   *lc;
+		bool		first;
+
+		for (i = 1; i < *numSlots; i++)
+		{
+			first = true;
+			appendStringInfoString(&sql, ", (");
+			foreach(lc, fmstate->target_attrs)
+			{
+				int				attnum = lfirst_int(lc);
+				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+				if (!first)
+					appendStringInfoString(&sql, ", ");
+				first = false;
+
+				if (attr->attgenerated)
+					appendStringInfoString(&sql, "DEFAULT");
+				else
+					appendStringInfoString(&sql, "?");
+			}
+			appendStringInfoChar(&sql, ')');
+		}
+	}
+
+	elog(DEBUG2, "monetdb_fdw batch INSERT: %s", sql.data);
+
+	/* Collect all parameter values for every slot (p_nums params each). */
+	p_values = convert_prep_stmt_params(fmstate, NIL, slots, *numSlots);
+	total_params = fmstate->p_nums * *numSlots;
+
+	/* Prepare, bind all params, execute. */
+	result = mapi_prepare(fmstate->conn, sql.data);
+	for (i = 0; i < total_params; i++)
+	{
+		elog(DEBUG2, "monetdb_fdw batch bind[%d]: %s",
+			 i, p_values[i] ? p_values[i] : "NULL");
+		mapi_param_string(result, i, MAPI_VARCHAR,
+						  (char *) p_values[i], NULL);
+	}
+	mapi_execute(result);
+
+	if (result == NULL || mapi_error(fmstate->conn))
+		die(fmstate->conn, result);
+
+	n_rows = mapi_get_row_count(result);
+	mapi_close_handle(result);
+
+	pfree(sql.data);
+	MemoryContextReset(fmstate->temp_cxt);
+
+	*numSlots = n_rows;
+	return (n_rows > 0) ? slots : NULL;
+}
+
+/*
+ * MonetDB_GetForeignModifyBatchSize
+ *		Return the batch size for INSERT operations.
+ */
+static int
+MonetDB_GetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
+{
+	MonetdbFdwModifyState *fmstate =
+		(MonetdbFdwModifyState *) resultRelInfo->ri_FdwState;
+
+	/*
+	 * fmstate is NULL during EXPLAIN before BeginForeignModify; in that case
+	 * return the default so the planner knows batching is supported.
+	 */
+	return (fmstate != NULL && fmstate->batch_size > 0)
+		? fmstate->batch_size : 256;
 }
 
 /*
@@ -2151,23 +2440,274 @@ MonetDB_RecheckForeignScan(ForeignScanState *node, TupleTableSlot *slot)
 }
 
 /*
+ * find_modifytable_subplan
+ *		Helper to locate the ForeignScan subplan that scans the target RTI.
+ *		Returns NULL if the subplan cannot be identified (direct modify unsafe).
+ */
+static ForeignScan *
+find_modifytable_subplan(PlannerInfo *root,
+						 ModifyTable *plan,
+						 Index rtindex,
+						 int subplan_index)
+{
+	Plan	   *subplan = outerPlan(plan);
+
+	/*
+	 * Handle Append (partitioned tables) and Result atop Append.
+	 */
+	if (IsA(subplan, Append))
+	{
+		Append	   *appendplan = (Append *) subplan;
+
+		if (subplan_index < list_length(appendplan->appendplans))
+			subplan = (Plan *) list_nth(appendplan->appendplans, subplan_index);
+	}
+	else if (IsA(subplan, Result) &&
+			 outerPlan(subplan) != NULL &&
+			 IsA(outerPlan(subplan), Append))
+	{
+		Append	   *appendplan = (Append *) outerPlan(subplan);
+
+		if (subplan_index < list_length(appendplan->appendplans))
+			subplan = (Plan *) list_nth(appendplan->appendplans, subplan_index);
+	}
+
+	if (IsA(subplan, ForeignScan))
+	{
+		ForeignScan *fscan = (ForeignScan *) subplan;
+
+		if (bms_is_member(rtindex, fscan->fs_relids))
+			return fscan;
+	}
+
+	return NULL;
+}
+
+/*
+ * MonetDB_PlanDirectModify
+ *		Consider pushing an UPDATE or DELETE entirely to MonetDB as a single
+ *		SQL statement instead of the default scan-then-per-row-DML approach.
+ *
+ *		Returns true and rewrites the ForeignScan fdw_private if the operation
+ *		can be safely pushed down.
+ */
+static bool
+MonetDB_PlanDirectModify(PlannerInfo *root,
+						 ModifyTable *plan,
+						 Index resultRelation,
+						 int subplan_index)
+{
+	CmdType		operation = plan->operation;
+	RelOptInfo *foreignrel;
+	RangeTblEntry *rte;
+	MonetdbFdwRelationInfo *fpinfo;
+	Relation	rel;
+	StringInfoData sql;
+	ForeignScan *fscan;
+	List	   *processed_tlist = NIL;
+	List	   *targetAttrs = NIL;
+	List	   *remote_exprs;
+	List	   *params_list = NIL;
+	List	   *returningList = NIL;
+	List	   *retrieved_attrs = NIL;
+
+	/* Only UPDATE and DELETE can be pushed directly */
+	if (operation != CMD_UPDATE && operation != CMD_DELETE)
+		return false;
+
+	/* Find the ForeignScan subplan for this relation */
+	fscan = find_modifytable_subplan(root, plan, resultRelation, subplan_index);
+	if (!fscan)
+		return false;
+
+	/* Any local qual means we cannot bypass the scan-then-DML path */
+	if (fscan->scan.plan.qual != NIL)
+		return false;
+
+	/* Only plain base-relation scans; no pushed-down joins */
+	if (fscan->scan.scanrelid == 0)
+		return false;
+
+	foreignrel = root->simple_rel_array[resultRelation];
+	rte = root->simple_rte_array[resultRelation];
+	fpinfo = (MonetdbFdwRelationInfo *) foreignrel->fdw_private;
+
+	/* RETURNING not supported in direct modify (no row-by-row result) */
+	if (plan->returningLists)
+		return false;
+
+	/* For UPDATE: all SET expressions must be remotely evaluable */
+	if (operation == CMD_UPDATE)
+	{
+		ListCell   *lc,
+				   *lc2;
+
+		get_translated_update_targetlist(root, resultRelation,
+										 &processed_tlist, &targetAttrs);
+
+		forboth(lc, processed_tlist, lc2, targetAttrs)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			AttrNumber	attno = lfirst_int(lc2);
+
+			Assert(!tle->resjunk);
+			if (attno <= InvalidAttrNumber)
+				elog(ERROR, "system-column update is not supported");
+
+			if (!is_foreign_expr(root, foreignrel, (Expr *) tle->expr))
+				return false;
+		}
+	}
+
+	/* WHERE conditions are already verified remote-safe in final_remote_exprs */
+	remote_exprs = fpinfo->final_remote_exprs;
+
+	initStringInfo(&sql);
+	rel = table_open(rte->relid, NoLock);
+
+	switch (operation)
+	{
+		case CMD_UPDATE:
+			deparseDirectUpdateSql(&sql, root, resultRelation, rel,
+								   foreignrel,
+								   processed_tlist,
+								   targetAttrs,
+								   remote_exprs, &params_list,
+								   returningList, &retrieved_attrs);
+			break;
+		case CMD_DELETE:
+			deparseDirectDeleteSql(&sql, root, resultRelation, rel,
+								   foreignrel,
+								   remote_exprs, &params_list,
+								   returningList, &retrieved_attrs);
+			break;
+		default:
+			elog(ERROR, "unexpected operation: %d", (int) operation);
+	}
+
+	table_close(rel, NoLock);
+
+	/* Rewrite the ForeignScan plan node for direct execution */
+	fscan->operation = operation;
+	fscan->resultRelation = resultRelation;
+	fscan->fdw_exprs = params_list;
+
+#if PG_VERSION_NUM >= 150000
+	fscan->fdw_private = list_make4(makeString(sql.data),
+									makeBoolean(retrieved_attrs != NIL),
+									retrieved_attrs,
+									makeBoolean(plan->canSetTag));
+#else
+	fscan->fdw_private = list_make4(makeString(sql.data),
+									makeInteger((retrieved_attrs != NIL) ? 1 : 0),
+									retrieved_attrs,
+									makeInteger(plan->canSetTag ? 1 : 0));
+#endif
+
+	if (fscan->scan.plan.async_capable)
+		fscan->scan.plan.async_capable = false;
+
+	return true;
+}
+
+/*
  * MonetDB_BeginDirectModify
  *		Prepare a direct foreign table modification
  */
 static void
 MonetDB_BeginDirectModify(ForeignScanState *node, int eflags)
 {
-	elog(ERROR, "MonetDB_BeginDirectModify not supported yet");
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	EState	   *estate = node->ss.ps.state;
+	MonetdbFdwDirectModifyState *dmstate;
+	Oid			userid;
+	ForeignTable *table;
+	UserMapping *user;
+	ForeignServer *server;
+
+	/* Do nothing in EXPLAIN (no ANALYZE) case; node->fdw_state stays NULL */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	dmstate = (MonetdbFdwDirectModifyState *) palloc0(sizeof(MonetdbFdwDirectModifyState));
+	node->fdw_state = (void *) dmstate;
+
+	/* Identify the target relation and user */
+#if PG_VERSION_NUM >= 160000
+	userid = OidIsValid(fsplan->checkAsUser) ? fsplan->checkAsUser : GetUserId();
+#else
+	{
+		int rtindex = node->resultRelInfo->ri_RangeTableIndex;
+		RangeTblEntry *rte = exec_rt_fetch(rtindex, estate);
+		userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+	}
+#endif
+
+	dmstate->rel = node->ss.ss_currentRelation;
+
+	/* Get connection to MonetDB */
+	table = GetForeignTable(RelationGetRelid(dmstate->rel));
+	user = GetUserMapping(userid, table->serverid);
+	server = GetForeignServer(table->serverid);
+	dmstate->conn = GetConnection(user, server);
+
+	/* Extract planner-generated private data */
+	dmstate->query = strVal(list_nth(fsplan->fdw_private,
+									 FdwDirectModifyPrivateUpdateSql));
+#if PG_VERSION_NUM >= 150000
+	dmstate->has_returning = boolVal(list_nth(fsplan->fdw_private,
+											  FdwDirectModifyPrivateHasReturning));
+	dmstate->set_processed = boolVal(list_nth(fsplan->fdw_private,
+											  FdwDirectModifyPrivateSetProcessed));
+#else
+	dmstate->has_returning = intVal(list_nth(fsplan->fdw_private,
+											 FdwDirectModifyPrivateHasReturning));
+	dmstate->set_processed = intVal(list_nth(fsplan->fdw_private,
+											 FdwDirectModifyPrivateSetProcessed));
+#endif
+	dmstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
+												 FdwDirectModifyPrivateRetrievedAttrs);
+	dmstate->num_tuples = -1;	/* not yet executed */
+
+	dmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "monetdb_fdw temporary data",
+											  ALLOCSET_SMALL_SIZES);
 }
 
 /*
  * MonetDB_IterateDirectModify
- *		Execute a direct foreign table modification
+ *		Execute a direct foreign table modification.
+ *
+ *		On the first call the SQL is sent to MonetDB and the number of affected
+ *		rows is recorded.  We then update es_processed and return an empty slot
+ *		(no RETURNING support) so the executor's loop terminates immediately.
  */
 static TupleTableSlot *
 MonetDB_IterateDirectModify(ForeignScanState *node)
 {
-	elog(ERROR, "MonetDB_IterateDirectModify not supported yet");
+	MonetdbFdwDirectModifyState *dmstate =
+		(MonetdbFdwDirectModifyState *) node->fdw_state;
+	EState	   *estate = node->ss.ps.state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	/* Execute the statement exactly once */
+	if (dmstate->num_tuples == -1)
+	{
+		dmstate->hdl = mapi_query(dmstate->conn, dmstate->query);
+		if (dmstate->hdl == NULL || mapi_error(dmstate->conn) != MOK)
+			die(dmstate->conn, dmstate->hdl);
+
+		dmstate->num_tuples = mapi_rows_affected(dmstate->hdl);
+		mapi_close_handle(dmstate->hdl);
+		dmstate->hdl = NULL;
+
+		/* Propagate affected-row count to the command tag */
+		if (dmstate->set_processed)
+			estate->es_processed += (uint64) dmstate->num_tuples;
+	}
+
+	/* No RETURNING: signal end-of-scan to the executor */
+	return ExecClearTuple(slot);
 }
 
 /*
@@ -2177,7 +2717,21 @@ MonetDB_IterateDirectModify(ForeignScanState *node)
 static void
 MonetDB_EndDirectModify(ForeignScanState *node)
 {
-	elog(ERROR, "MonetDB_EndDirectModify not supported yet");
+	MonetdbFdwDirectModifyState *dmstate =
+		(MonetdbFdwDirectModifyState *) node->fdw_state;
+
+	/* dmstate is NULL when we are in EXPLAIN (no ANALYZE) */
+	if (dmstate == NULL)
+		return;
+
+	if (dmstate->hdl != NULL)
+	{
+		mapi_close_handle(dmstate->hdl);
+		dmstate->hdl = NULL;
+	}
+
+	ReleaseConnection(dmstate->conn);
+	dmstate->conn = NULL;
 }
 
 /*
@@ -2188,18 +2742,9 @@ static void
 MonetDB_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	MonetdbFdwScanState *fsstate = (MonetdbFdwScanState *) node->fdw_state;
-	char	*remote_sql = psprintf("plan %s", fsstate->query);
-	elog(DEBUG2, "monetdb_fdw remote query is: %s", remote_sql);
 
-	/* show query */
+	/* Show the SQL query that will be sent to MonetDB */
 	ExplainPropertyText("MonetDB query", fsstate->query, es);
-	if ((fsstate->hdl = mapi_query(fsstate->conn, remote_sql)) == NULL || mapi_error(fsstate->conn))
-		die(fsstate->conn, fsstate->hdl);
-	/* show plan */
-	while (mapi_fetch_row(fsstate->hdl)) {
-		ExplainPropertyText("MonetDB plan", mapi_fetch_field(fsstate->hdl, 0), es);
-	}
-	pfree(remote_sql);
 }
 
 /*
@@ -2227,7 +2772,13 @@ MonetDB_ExplainForeignModify(ModifyTableState *mtstate,
 static void
 MonetDB_ExplainDirectModify(ForeignScanState *node, ExplainState *es)
 {
-	elog(ERROR, "MonetDB_ExplainDirectModify not supported yet");
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+
+	if (list_length(fsplan->fdw_private) > FdwDirectModifyPrivateUpdateSql)
+		ExplainPropertyText("MonetDB statement",
+							strVal(list_nth(fsplan->fdw_private,
+											FdwDirectModifyPrivateUpdateSql)),
+							es);
 }
 
 /*
@@ -2357,7 +2908,8 @@ estimate_path_cost_size(PlannerInfo *root,
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) foreignrel->fdw_private;
 	double		rows;
 	double		retrieved_rows;
-	int			width;
+	/* Initialize to reltarget width as fallback for the remote-estimate path */
+	int			width = foreignrel->reltarget->width;
 	Cost		startup_cost;
 	Cost		total_cost;
 
@@ -2502,81 +3054,32 @@ estimate_path_cost_size(PlannerInfo *root,
 		}
 		else if (IS_JOIN_REL(foreignrel))
 		{
-			MonetdbFdwRelationInfo *fpinfo_i;
-			MonetdbFdwRelationInfo *fpinfo_o;
-			QualCost	join_cost;
-			QualCost	remote_conds_cost;
-			double		nrows;
-
 			/* Use rows/width estimates made by the core code. */
 			rows = foreignrel->rows;
 			width = foreignrel->reltarget->width;
 
-			/* For join we expect inner and outer relations set */
-			Assert(fpinfo->innerrel && fpinfo->outerrel);
-
-			fpinfo_i = (MonetdbFdwRelationInfo *) fpinfo->innerrel->fdw_private;
-			fpinfo_o = (MonetdbFdwRelationInfo *) fpinfo->outerrel->fdw_private;
-
-			/* Estimate of number of rows in cross product */
-			nrows = fpinfo_i->rows * fpinfo_o->rows;
-
 			/*
-			 * Back into an estimate of the number of retrieved rows.  Just in
-			 * case this is nuts, clamp to at most nrows.
+			 * For a pushed-down join, MonetDB executes the entire join
+			 * internally using its efficient columnar engine.  The cost to
+			 * PostgreSQL is just one remote query round-trip plus the cost of
+			 * receiving and locally filtering the result rows.
+			 *
+			 * The old model used nrows = fpinfo_i->rows * fpinfo_o->rows
+			 * (Cartesian product), which massively overestimates the cost for
+			 * large tables and causes the planner to fragment joins across
+			 * multiple remote scans instead of pushing them down as a single
+			 * efficient remote query.
 			 */
 			retrieved_rows = clamp_row_est(rows / fpinfo->local_conds_sel);
-			retrieved_rows = Min(retrieved_rows, nrows);
 
-			/*
-			 * The cost of foreign join is estimated as cost of generating
-			 * rows for the joining relations + cost for applying quals on the
-			 * rows.
-			 */
-
-			/*
-			 * Calculate the cost of clauses pushed down to the foreign server
-			 */
-			cost_qual_eval(&remote_conds_cost, fpinfo->remote_conds, root);
-			/* Calculate the cost of applying join clauses */
-			cost_qual_eval(&join_cost, fpinfo->joinclauses, root);
-
-			/*
-			 * Startup cost includes startup cost of joining relations and the
-			 * startup cost for join and other clauses. We do not include the
-			 * startup cost specific to join strategy (e.g. setting up hash
-			 * tables) since we do not know what strategy the foreign server
-			 * is going to use.
-			 */
-			startup_cost = fpinfo_i->rel_startup_cost + fpinfo_o->rel_startup_cost;
-			startup_cost += join_cost.startup;
-			startup_cost += remote_conds_cost.startup;
+			/* One network round-trip overhead, independent of join width */
+			startup_cost = fpinfo->fdw_startup_cost;
 			startup_cost += fpinfo->local_conds_cost.startup;
-
-			/*
-			 * Run time cost includes:
-			 *
-			 * 1. Run time cost (total_cost - startup_cost) of relations being
-			 * joined
-			 *
-			 * 2. Run time cost of applying join clauses on the cross product
-			 * of the joining relations.
-			 *
-			 * 3. Run time cost of applying pushed down other clauses on the
-			 * result of join
-			 *
-			 * 4. Run time cost of applying nonpushable other clauses locally
-			 * on the result fetched from the foreign server.
-			 */
-			run_cost = fpinfo_i->rel_total_cost - fpinfo_i->rel_startup_cost;
-			run_cost += fpinfo_o->rel_total_cost - fpinfo_o->rel_startup_cost;
-			run_cost += nrows * join_cost.per_tuple;
-			nrows = clamp_row_est(nrows * fpinfo->joinclause_sel);
-			run_cost += nrows * remote_conds_cost.per_tuple;
-			run_cost += fpinfo->local_conds_cost.per_tuple * retrieved_rows;
-
-			/* Add in tlist eval cost for each output row */
 			startup_cost += foreignrel->reltarget->cost.startup;
+
+			/* Cost of receiving result rows plus any local filtering */
+			run_cost = fpinfo->fdw_tuple_cost * retrieved_rows;
+			run_cost += fpinfo->local_conds_cost.per_tuple * retrieved_rows;
 			run_cost += foreignrel->reltarget->cost.per_tuple * rows;
 		}
 		else if (IS_UPPER_REL(foreignrel))
@@ -3001,8 +3504,14 @@ fetch_more_data(ForeignScanState *node)
 		if (fsstate->fetch_ct_2 < 2)
 			fsstate->fetch_ct_2++;
 
-		/* Must be EOF if we didn't get as many tuples as we asked for. */
-		fsstate->eof_reached = (numrows < fsstate->fetch_size);
+		/*
+		 * MAPI returns the full result set in one shot, so there is nothing
+		 * more to fetch after this call.  Setting eof_reached=true prevents
+		 * IterateForeignScan from calling us again with an exhausted cursor,
+		 * which would otherwise spin in an infinite loop.
+		 * (ReScanForeignScan resets eof_reached=false before each new scan.)
+		 */
+		fsstate->eof_reached = true;
 	}
 	PG_FINALLY();
 	{
@@ -3080,7 +3589,8 @@ prepare_query_params(PlanState *node,
 					 int numParams,
 					 FmgrInfo **param_flinfo,
 					 List **param_exprs,
-					 const char ***param_values)
+					 const char ***param_values,
+					 Oid **param_types)
 {
 	int			i;
 	ListCell   *lc;
@@ -3089,6 +3599,7 @@ prepare_query_params(PlanState *node,
 
 	/* Prepare for output conversion of parameters used in remote query. */
 	*param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
+	*param_types  = (Oid *) palloc(numParams * sizeof(Oid));
 
 	i = 0;
 	foreach(lc, fdw_exprs)
@@ -3097,7 +3608,8 @@ prepare_query_params(PlanState *node,
 		Oid			typefnoid;
 		bool		isvarlena;
 
-		getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
+		(*param_types)[i] = exprType(param_expr);
+		getTypeOutputInfo((*param_types)[i], &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &(*param_flinfo)[i]);
 		i++;
 	}
@@ -3115,6 +3627,140 @@ prepare_query_params(PlanState *node,
 	/* Allocate buffer for text form of query parameters. */
 	*param_values = (const char **) palloc0(numParams * sizeof(char *));
 }
+
+/*
+ * build_parameterized_query
+ *		Evaluate runtime parameters and return a copy of query_template with
+ *		every "$N::typename" placeholder replaced by the current literal value.
+ *
+ * MAPI does not support server-side parameter binding, so we must embed the
+ * values directly in the SQL string.  We apply the same quoting rules used
+ * by deparseConst() so that the resulting SQL is valid MonetDB syntax.
+ */
+static char *
+build_parameterized_query(const char *query_template,
+						  int numParams,
+						  FmgrInfo *param_flinfo,
+						  Oid *param_types,
+						  List *param_exprs,
+						  ExprContext *econtext)
+{
+	StringInfoData buf;
+	const char *p;
+	Datum	   *values;
+	bool	   *nulls;
+	ListCell   *lc;
+	int			i;
+
+	values = (Datum *) palloc(numParams * sizeof(Datum));
+	nulls  = (bool *)  palloc(numParams * sizeof(bool));
+
+	/* Evaluate all parameter expressions. */
+	i = 0;
+	foreach(lc, param_exprs)
+	{
+		ExprState  *expr = (ExprState *) lfirst(lc);
+
+		values[i] = ExecEvalExprSwitchContext(expr, econtext, &nulls[i]);
+		i++;
+	}
+
+	initStringInfo(&buf);
+
+	/*
+	 * Walk through the template.  When we see "$N" (optionally followed by
+	 * "::typename"), replace it with the properly-quoted literal value.
+	 */
+	p = query_template;
+	while (*p)
+	{
+		if (*p == '$' && isdigit((unsigned char) *(p + 1)))
+		{
+			int		pnum = 0;
+
+			p++;	/* skip '$' */
+			while (isdigit((unsigned char) *p))
+			{
+				pnum = pnum * 10 + (*p - '0');
+				p++;
+			}
+
+			/* Skip the "::typename" cast if present. */
+			if (p[0] == ':' && p[1] == ':')
+			{
+				p += 2;
+				/* Type name: letters, digits, underscores, dots, quotes. */
+				while (isalnum((unsigned char) *p) ||
+					   *p == '_' || *p == '.' || *p == '"')
+					p++;
+			}
+
+			if (pnum >= 1 && pnum <= numParams)
+			{
+				int		idx = pnum - 1;
+
+				if (nulls[idx])
+				{
+					appendStringInfoString(&buf, "NULL");
+				}
+				else
+				{
+					char   *extval = OutputFunctionCall(&param_flinfo[idx],
+														values[idx]);
+
+					switch (param_types[idx])
+					{
+						case INT2OID:
+						case INT4OID:
+						case INT8OID:
+						case OIDOID:
+						case FLOAT4OID:
+						case FLOAT8OID:
+						case NUMERICOID:
+							/*
+							 * No quoting needed for plain numeric strings.
+							 * Wrap in parens if it starts with a sign to avoid
+							 * parse ambiguity (mirrors deparseConst logic).
+							 */
+							if (strspn(extval, "0123456789+-eE.") == strlen(extval))
+							{
+								if (extval[0] == '+' || extval[0] == '-')
+									appendStringInfo(&buf, "(%s)", extval);
+								else
+									appendStringInfoString(&buf, extval);
+							}
+							else
+								appendStringInfo(&buf, "'%s'", extval);
+							break;
+						case BOOLOID:
+							appendStringInfoString(&buf,
+								strcmp(extval, "t") == 0 ? "true" : "false");
+							break;
+						default:
+							/* All other types: emit as a quoted string literal. */
+							deparseStringLiteral(&buf, extval);
+							break;
+					}
+					pfree(extval);
+				}
+				continue;	/* already advanced p past the placeholder */
+			}
+			/* Out-of-range index — output the "$N" text as-is. */
+			appendStringInfo(&buf, "$%d", pnum);
+		}
+		else
+		{
+			appendStringInfoChar(&buf, *p);
+			p++;
+		}
+	}
+
+	pfree(values);
+	pfree(nulls);
+
+	return buf.data;
+}
+
 
 /*
  * MonetDB_AnalyzeForeignTable
@@ -4562,7 +5208,7 @@ make_tuple_from_result_row(MapiHdl res,
 	ErrorContextCallback errcallback;
 	MemoryContext oldcontext;
 	ListCell   *lc;
-	int			j;
+	int			j = 0;
 
 	Assert(row < mapi_get_row_count(res));
 
@@ -4625,6 +5271,27 @@ make_tuple_from_result_row(MapiHdl res,
 				/* ordinary column */
 				Assert(i <= tupdesc->natts);
 				nulls[i - 1] = (valstr == NULL);
+
+				/*
+				 * MonetDB returns BLOB values as raw hex strings (e.g.
+				 * "48656c6c6f").  PostgreSQL's bytea_in expects the \x-prefix
+				 * hex format (e.g. "\x48656c6c6f").  Prepend "\x" so that
+				 * bytea columns (and domains over bytea such as "blob") are
+				 * decoded correctly.
+				 */
+				if (valstr != NULL)
+				{
+					Oid coltype = TupleDescAttr(tupdesc, i - 1)->atttypid;
+					if (getBaseType(coltype) == BYTEAOID)
+					{
+						char *hex = palloc(strlen(valstr) + 3);
+						hex[0] = '\\';
+						hex[1] = 'x';
+						strcpy(hex + 2, valstr);
+						valstr = hex;
+					}
+				}
+
 				/* Apply the input function even to nulls, to support domains */
 				values[i - 1] = InputFunctionCall(&attinmeta->attinfuncs[i - 1],
 												  valstr,
@@ -5018,6 +5685,7 @@ static MonetdbFdwModifyState *create_foreign_modify(EState *estate,
 	Assert(fmstate->p_nums <= n_params);
 
 	fmstate->num_slots = 1;
+	fmstate->batch_size = 256;
 
 	/* Initialize auxiliary state */
 	fmstate->aux_fmstate = NULL;
@@ -5361,6 +6029,62 @@ getBoolVal(DefElem *def)
 }
 
 /*
+ * add_missing_vars_to_reltarget
+ *
+ * Walk the given list of RestrictInfos and add any Var nodes that belong to
+ * 'rel' (i.e. their varno is in rel->relids) but are not yet present in
+ * rel->reltarget->exprs.  Used when a JOIN_SEMI relation is about to be
+ * wrapped as a subquery: the parent join's ON clause may reference columns
+ * from that semi-join that the planner did not include in its reltarget
+ * (because they are only consumed in the ON clause, not passed above).
+ */
+static void
+add_missing_vars_to_reltarget(RelOptInfo *rel, List *clauses)
+{
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		List	   *vars;
+		ListCell   *vlc;
+
+		vars = pull_var_clause((Node *) rinfo->clause,
+							   PVC_RECURSE_AGGREGATES |
+							   PVC_RECURSE_PLACEHOLDERS);
+
+		foreach(vlc, vars)
+		{
+			Var		   *var = lfirst_node(Var, vlc);
+			bool		found = false;
+			ListCell   *tlc;
+
+			/* Only consider Vars that belong to this rel */
+			if (!bms_is_member(var->varno, rel->relids))
+				continue;
+
+			/* Skip if already in reltarget */
+			foreach(tlc, rel->reltarget->exprs)
+			{
+				Var		   *tv = (Var *) lfirst(tlc);
+
+				if (IsA(tv, Var) &&
+					tv->varno == var->varno &&
+					tv->varattno == var->varattno)
+				{
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+				rel->reltarget->exprs = lappend(rel->reltarget->exprs,
+												copyObject(var));
+		}
+	}
+}
+
+/*
  * Assess whether the join between inner and outer relations can be pushed down
  * to the foreign server. As a side effect, save information we obtain in this
  * function to MonetdbFdwRelationInfo passed in.
@@ -5377,12 +6101,13 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
-	 * Constructing queries representing SEMI and ANTI joins is hard, hence
-	 * not considered right now.
+	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, and SEMI joins.
+	 * SEMI joins are deparsed as EXISTS (SELECT 1 FROM inner WHERE ...).
+	 * ANTI joins are not yet supported.
 	 */
 	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
-		jointype != JOIN_RIGHT && jointype != JOIN_FULL)
+		jointype != JOIN_RIGHT && jointype != JOIN_FULL &&
+		jointype != JOIN_SEMI)
 		return false;
 
 	/*
@@ -5392,6 +6117,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	fpinfo = (MonetdbFdwRelationInfo *) joinrel->fdw_private;
 	fpinfo_o = (MonetdbFdwRelationInfo *) outerrel->fdw_private;
 	fpinfo_i = (MonetdbFdwRelationInfo *) innerrel->fdw_private;
+
 	if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
 		!fpinfo_i || !fpinfo_i->pushdown_safe)
 		return false;
@@ -5438,6 +6164,16 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		if (IS_OUTER_JOIN(jointype) &&
 			!RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
 		{
+			if (!is_remote_clause)
+				return false;
+			joinclauses = lappend(joinclauses, rinfo);
+		}
+		else if (jointype == JOIN_SEMI)
+		{
+			/*
+			 * All semi-join correlation conditions must be shippable; if any
+			 * cannot be pushed, the whole semi-join cannot be pushed.
+			 */
 			if (!is_remote_clause)
 				return false;
 			joinclauses = lappend(joinclauses, rinfo);
@@ -5563,6 +6299,15 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			}
 			break;
 
+		case JOIN_SEMI:
+			/*
+			 * Semi-join: joinclauses already holds the correlation conditions
+			 * (set in the loop above).  Inner and outer conditions remain in
+			 * their respective fpinfos and are expanded by deparseFromExpr
+			 * via deparseExistsSubquery.  No conditions are merged here.
+			 */
+			break;
+
 		default:
 			/* Should not happen, we have just checked this above */
 			elog(ERROR, "unsupported join type %d", jointype);
@@ -5572,12 +6317,50 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 * For an inner join, all restrictions can be treated alike. Treating the
 	 * pushed down conditions as join conditions allows a top level full outer
 	 * join to be deparsed without requiring subqueries.
+	 * For a semi join, joinclauses were already set above; leave as-is.
 	 */
 	if (jointype == JOIN_INNER)
 	{
 		Assert(!fpinfo->joinclauses);
 		fpinfo->joinclauses = fpinfo->remote_conds;
 		fpinfo->remote_conds = NIL;
+	}
+
+	/*
+	 * If one of the input relations is a semi-join, the deparser will wrap it
+	 * as an EXISTS-based subquery (sq{N}(c1,c2,...)).  The parent ON clause
+	 * may reference columns from that semi-join that the planner did not put
+	 * in its reltarget (because those columns are only needed for the ON
+	 * clause, not passed further up).  Promote the semi-join to a proper
+	 * named subquery and extend its reltarget with any such missing Vars so
+	 * that get_relation_column_alias_ids can find them.
+	 *
+	 * This is not needed when we are building a SEMI join ourselves: the
+	 * inner rel of a SEMI join is rendered via deparseExistsSubquery (nested
+	 * EXISTS), and the outer rel is just a plain FROM entry.
+	 */
+	if (jointype != JOIN_SEMI)
+	{
+		if (IS_JOIN_REL(outerrel) && fpinfo_o->jointype == JOIN_SEMI &&
+			!fpinfo->make_outerrel_subquery)
+		{
+			fpinfo->make_outerrel_subquery = true;
+			fpinfo->lower_subquery_rels =
+				bms_add_members(fpinfo->lower_subquery_rels,
+								outerrel->relids);
+			add_missing_vars_to_reltarget(outerrel, fpinfo->joinclauses);
+			add_missing_vars_to_reltarget(outerrel, fpinfo->remote_conds);
+		}
+		if (IS_JOIN_REL(innerrel) && fpinfo_i->jointype == JOIN_SEMI &&
+			!fpinfo->make_innerrel_subquery)
+		{
+			fpinfo->make_innerrel_subquery = true;
+			fpinfo->lower_subquery_rels =
+				bms_add_members(fpinfo->lower_subquery_rels,
+								innerrel->relids);
+			add_missing_vars_to_reltarget(innerrel, fpinfo->joinclauses);
+			add_missing_vars_to_reltarget(innerrel, fpinfo->remote_conds);
+		}
 	}
 
 	/* Mark that this join can be pushed down safely */

@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	131.561	FS	batch run; single foreign scan classification
+Q02	OK	22.039	FS	batch run; single foreign scan classification
+Q03	OK	22.965	FS	batch run; single foreign scan classification
+Q04	OK	126.061	FS	batch run; single foreign scan classification
+Q05	OK	30.468	FS	validated isolated; single Foreign Scan
+Q06	OK	8.123	FS	batch run; single foreign scan classification
+Q07	OK	46.753	FS	batch run; single foreign scan classification
+Q08	OK	48.262	FS+LOCAL_SORT	fixed by deparsing extract as SQL EXTRACT(field FROM expr)
+Q09	OK	70.303	FS	fixed by deparsing upper ORDER BY as select-list ordinals
+Q10	OK	266.865	FS	validated isolated; single Foreign Scan
+Q11	OK	10.449	FS+INITPLAN	validated isolated; main Foreign Scan plus remote InitPlan
+Q12	OK	57.492	FS+LOCAL_AGG	fixed by deparsing ScalarArrayOpExpr as IN for literal arrays
+Q13	ISSUE	272.407	FS+LOCAL_AGG	remote grouped scan feeds local aggregate/sort
+Q14	OK	15.503	FS	validated isolated; single Foreign Scan
+Q15	OK	56.854	MIXED	isolated test with create view and drop view completed normally
+Q16	ISSUE	>5000	HANG	isolated execution exceeded budget; practical regression
+Q17	OK	40.268	FS	validated isolated; single Foreign Scan
+Q18	ISSUE	11677.252	FS+LOCAL_JOIN+LOCAL_AGG+LOCAL_SORT	validated isolated on PG18; no crash, local join/group aggregate/sort over remote scans
+Q19	OK	34.557	FS	validated isolated; single Foreign Scan
+Q20	OK	279.714	FS+LOCAL_SORT	validated isolated; remote query with local top sort
+Q21	ISSUE	4770.084	FS+LOCAL_ANTI_JOIN	local anti-join over 3.79M rows
+Q22	OK	4.416	MIXED	remote initplan plus local anti-join finished correctly

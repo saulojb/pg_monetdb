@@ -41,6 +41,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "monetdb_fdw.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -141,12 +142,16 @@ static void deparseConst(Const *node, deparse_expr_cxt *context, int showtype);
 static void deparseParam(Param *node, deparse_expr_cxt *context);
 static void deparseSubscriptingRef(SubscriptingRef *node, deparse_expr_cxt *context);
 static void deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context);
+static bool deparseExtractFuncExpr(FuncExpr *node, deparse_expr_cxt *context);
 static void deparseOpExpr(OpExpr *node, deparse_expr_cxt *context);
 static bool isPlainForeignVar(Expr *node, deparse_expr_cxt *context);
 static void deparseOperatorName(StringInfo buf, Form_pg_operator opform);
 static void deparseDistinctExpr(DistinctExpr *node, deparse_expr_cxt *context);
 static void deparseScalarArrayOpExpr(ScalarArrayOpExpr *node,
 									 deparse_expr_cxt *context);
+static bool deparseScalarArrayOpExprAsIn(ScalarArrayOpExpr *node,
+										 deparse_expr_cxt *context,
+										 Form_pg_operator opform);
 static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
@@ -160,6 +165,7 @@ static void deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_att
 							 deparse_expr_cxt *context);
 static void deparseLockingClause(deparse_expr_cxt *context);
 static void appendOrderByClause(List *pathkeys, bool has_final_sort,
+								List *targetList,
 								deparse_expr_cxt *context);
 static void appendLimitClause(deparse_expr_cxt *context);
 static void appendConditions(List *exprs, deparse_expr_cxt *context);
@@ -168,10 +174,15 @@ static void deparseFromExprForRel(StringInfo buf, PlannerInfo *root,
 								  Index ignore_rel, List **ignore_conds,
 								  List **params_list);
 static void deparseFromExpr(List *quals, deparse_expr_cxt *context);
+static void deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context);
+static void deparseExistsSubquery(StringInfo buf, PlannerInfo *root,
+								  RelOptInfo *rel, List *extra_conds,
+								  deparse_expr_cxt *context);
 static void deparseRangeTblRef(StringInfo buf, PlannerInfo *root,
 							   RelOptInfo *foreignrel, bool make_subquery,
 							   Index ignore_rel, List **ignore_conds, List **params_list);
 static void deparseAggref(Aggref *node, deparse_expr_cxt *context);
+static void deparseSubPlan(SubPlan *node, deparse_expr_cxt *context);
 static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendOrderBySuffix(Oid sortop, Oid sortcoltype, bool nulls_first,
 								deparse_expr_cxt *context);
@@ -260,13 +271,13 @@ is_foreign_expr(PlannerInfo *root,
 		return false;
 
 	/*
-	 * An expression which includes any mutable functions can't be sent over
-	 * because its result is not stable.  For example, sending now() remote
-	 * side could cause confusion from clock offsets.  Future versions might
-	 * be able to make this choice with more granularity.  (We check this last
-	 * because it requires a lot of expensive catalog lookups.)
+	 * An expression which includes any volatile functions can't be sent over
+	 * because its result may differ per row.  We allow STABLE functions since
+	 * they are consistent within a single query execution, which is all we
+	 * need for a single remote round-trip.  VOLATILE functions (random(),
+	 * clock_timestamp(), etc.) are still blocked.
 	 */
-	if (contain_mutable_functions((Node *) expr))
+	if (contain_volatile_functions((Node *) expr))
 		return false;
 
 	/* OK to evaluate on the remote server */
@@ -551,12 +562,19 @@ foreign_expr_walker(Node *node,
 
 				/*
 				 * If function's input collation is not derived from a foreign
-				 * Var, it can't be sent to remote.
+				 * Var, it can't be sent to remote — unless all inputs use the
+				 * default collation (constants, params, noncollatable columns),
+				 * which is safe because MonetDB uses the same default collation.
 				 */
 				if (fe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 fe->inputcollid != inner_cxt.collation)
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 fe->inputcollid == inner_cxt.collation)
+					 /* OK, collation derived from a foreign Var */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE &&
+						 fe->inputcollid == DEFAULT_COLLATION_OID)
+					 /* OK, inputs are constants/params with default collation */ ;
+				else
 					return false;
 
 				/*
@@ -599,12 +617,18 @@ foreign_expr_walker(Node *node,
 
 				/*
 				 * If operator's input collation is not derived from a foreign
-				 * Var, it can't be sent to remote.
+				 * Var, it can't be sent to remote — unless all inputs use the
+				 * default collation, which is safe for MonetDB.
 				 */
 				if (oe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 oe->inputcollid != inner_cxt.collation)
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 oe->inputcollid == inner_cxt.collation)
+					 /* OK, collation derived from a foreign Var */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE &&
+						 oe->inputcollid == DEFAULT_COLLATION_OID)
+					 /* OK, inputs are constants/params with default collation */ ;
+				else
 					return false;
 
 				/* Result-collation handling is same as for functions */
@@ -639,12 +663,18 @@ foreign_expr_walker(Node *node,
 
 				/*
 				 * If operator's input collation is not derived from a foreign
-				 * Var, it can't be sent to remote.
+				 * Var, it can't be sent to remote — unless all inputs use the
+				 * default collation, which is safe for MonetDB.
 				 */
 				if (oe->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 oe->inputcollid != inner_cxt.collation)
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 oe->inputcollid == inner_cxt.collation)
+					 /* OK, collation derived from a foreign Var */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE &&
+						 oe->inputcollid == DEFAULT_COLLATION_OID)
+					 /* OK, inputs are constants/params with default collation */ ;
+				else
 					return false;
 
 				/* Output is always boolean and so noncollatable. */
@@ -956,12 +986,18 @@ foreign_expr_walker(Node *node,
 
 				/*
 				 * If aggregate's input collation is not derived from a
-				 * foreign Var, it can't be sent to remote.
+				 * foreign Var, it can't be sent to remote — unless all inputs
+				 * use the default collation, which is safe for MonetDB.
 				 */
 				if (agg->inputcollid == InvalidOid)
 					 /* OK, inputs are all noncollatable */ ;
-				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
-						 agg->inputcollid != inner_cxt.collation)
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 agg->inputcollid == inner_cxt.collation)
+					 /* OK, collation derived from a foreign Var */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE &&
+						 agg->inputcollid == DEFAULT_COLLATION_OID)
+					 /* OK, inputs are constants/params with default collation */ ;
+				else
 					return false;
 
 				/*
@@ -980,6 +1016,64 @@ foreign_expr_walker(Node *node,
 					state = FDW_COLLATE_NONE;
 				else
 					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
+		case T_SubPlan:
+			{
+				SubPlan    *subplan = (SubPlan *) node;
+				Plan	   *subplan_plan;
+				ForeignScan *fscan;
+				ListCell   *lc;
+
+				/*
+				 * Only EXPR_SUBLINK (scalar correlated subquery) is supported.
+				 * IN/EXISTS/etc. sublinks would need different deparsing.
+				 */
+				if (subplan->subLinkType != EXPR_SUBLINK)
+					return false;
+
+				/*
+				 * The inner plan must be a ForeignScan.  This means the inner
+				 * subquery was already pushed to MonetDB as a parameterised
+				 * query.  We can then inline it as a correlated subquery in
+				 * the outer WHERE clause (see deparseSubPlan).
+				 */
+				subplan_plan = (Plan *) list_nth(glob_cxt->root->glob->subplans,
+												 subplan->plan_id - 1);
+				if (!IsA(subplan_plan, ForeignScan))
+					return false;
+				fscan = (ForeignScan *) subplan_plan;
+
+				/*
+				 * Verify that the inner ForeignScan is against the same
+				 * remote server as the outer relation.  For upper-rel scans
+				 * (pushed aggregates), fs_server is InvalidOid, so we instead
+				 * verify that the inner ForeignScan has an SQL string in
+				 * fdw_private[0] — this is only set by our own FDW, which
+				 * proves it was planned for the same MonetDB server.
+				 */
+				if (list_length(fscan->fdw_private) == 0 ||
+					!IsA(linitial(fscan->fdw_private), String))
+					return false;
+
+				/*
+				 * All outer-query arguments that are substituted for $N
+				 * placeholders must themselves be shippable.
+				 */
+				foreach(lc, subplan->args)
+				{
+					if (!foreign_expr_walker((Node *) lfirst(lc),
+											 glob_cxt, outer_cxt, case_arg_cxt))
+						return false;
+				}
+
+				/*
+				 * The SubPlan returns a scalar value; it has no collation of
+				 * its own that could conflict.
+				 */
+				collation = InvalidOid;
+				state = FDW_COLLATE_NONE;
+				check_type = false;
 			}
 			break;
 		default:
@@ -1137,7 +1231,12 @@ is_foreign_pathkey(PlannerInfo *root,
 static char *
 deparse_type_name(Oid type_oid, int32 typemod)
 {
+	/* bits16 was renamed to uint16 in PostgreSQL 19 */
+#if PG_VERSION_NUM >= 190000
+	uint16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+#else
 	bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
+#endif
 
 	if (!is_builtin(type_oid))
 		flags |= FORMAT_TYPE_FORCE_QUALIFY;
@@ -1269,7 +1368,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 
 	/* Add ORDER BY clause if we found any useful pathkeys */
 	if (pathkeys)
-		appendOrderByClause(pathkeys, has_final_sort, &context);
+		appendOrderByClause(pathkeys, has_final_sort, tlist, &context);
 
 	/* Add LIMIT clause if necessary */
 	if (has_limit)
@@ -1362,16 +1461,181 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 
 	/* Construct FROM clause */
 	appendStringInfoString(buf, " FROM ");
-	deparseFromExprForRel(buf, context->root, scanrel,
-						  (bms_membership(scanrel->relids) == BMS_MULTIPLE),
-						  (Index) 0, NULL, context->params_list);
 
-	/* Construct WHERE clause */
-	if (quals != NIL)
+	if (IS_JOIN_REL(scanrel) &&
+		((MonetdbFdwRelationInfo *) scanrel->fdw_private)->jointype == JOIN_SEMI)
+	{
+		/*
+		 * Semi-join: emit outer relation in FROM, then build WHERE with
+		 * EXISTS for the inner relation.
+		 */
+		deparseFromExprForSemiJoin(quals, context);
+	}
+	else
+	{
+		deparseFromExprForRel(buf, context->root, scanrel,
+							  (bms_membership(scanrel->relids) == BMS_MULTIPLE),
+							  (Index) 0, NULL, context->params_list);
+
+		/* Construct WHERE clause */
+		if (quals != NIL)
+		{
+			appendStringInfoString(buf, " WHERE ");
+			appendConditions(quals, context);
+		}
+	}
+}
+
+/*
+ * deparseFromExprForSemiJoin
+ *
+ * Generate FROM + WHERE for a top-level semi-join relation.
+ * The outer relation appears in FROM; the inner relation is expressed as
+ * EXISTS (SELECT 1 FROM inner WHERE joinclauses [AND inner_conds]).
+ * Any additional quals (pushed-down upper-rel conditions) are added to WHERE.
+ */
+static void
+deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	RelOptInfo *scanrel = context->scanrel;
+	MonetdbFdwRelationInfo *fpinfo =
+		(MonetdbFdwRelationInfo *) scanrel->fdw_private;
+	RelOptInfo *outerrel = fpinfo->outerrel;
+	RelOptInfo *innerrel = fpinfo->innerrel;
+	MonetdbFdwRelationInfo *fpinfo_o =
+		(MonetdbFdwRelationInfo *) outerrel->fdw_private;
+	bool		is_first = true;
+
+	/* Emit the outer relation's FROM entry */
+	deparseRangeTblRef(buf, context->root, outerrel,
+					   fpinfo->make_outerrel_subquery,
+					   0, NULL, context->params_list);
+
+	/* Build WHERE: outer_conds AND EXISTS(inner, joinclauses) AND quals */
+	if (fpinfo_o->remote_conds || fpinfo->joinclauses || quals)
 	{
 		appendStringInfoString(buf, " WHERE ");
-		appendConditions(quals, context);
+
+		if (fpinfo_o->remote_conds)
+		{
+			appendConditions(fpinfo_o->remote_conds, context);
+			is_first = false;
+		}
+
+		if (fpinfo->joinclauses)
+		{
+			if (!is_first)
+				appendStringInfoString(buf, " AND ");
+			deparseExistsSubquery(buf, context->root, innerrel,
+								  fpinfo->joinclauses, context);
+			is_first = false;
+		}
+
+		if (quals)
+		{
+			if (!is_first)
+				appendStringInfoString(buf, " AND ");
+			appendConditions(quals, context);
+		}
 	}
+}
+
+/*
+ * deparseExistsSubquery
+ *
+ * Emit: EXISTS (SELECT 1 FROM rel WHERE rel_conds AND extra_conds)
+ *
+ * For nested semi-join relations the function recurses, producing nested
+ * EXISTS subqueries.  For base relations fpinfo->remote_conds are the
+ * relation's own filter conditions.  Column references are resolved against
+ * context->scanrel (the full outer semi-join rel), so they are always
+ * correctly qualified (e.g. r2.ps_partkey).
+ */
+static void
+deparseExistsSubquery(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+					  List *extra_conds, deparse_expr_cxt *context)
+{
+	MonetdbFdwRelationInfo *fpinfo =
+		(MonetdbFdwRelationInfo *) rel->fdw_private;
+
+	appendStringInfoString(buf, "EXISTS (SELECT 1 FROM ");
+
+	if (IS_JOIN_REL(rel) && fpinfo->jointype == JOIN_SEMI)
+	{
+		/*
+		 * Nested semi-join: expand as outer_from WHERE outer_conds AND
+		 * EXISTS(innerrel, inner_joinclauses) AND extra_conds.
+		 */
+		RelOptInfo *outerrel = fpinfo->outerrel;
+		RelOptInfo *innerrel = fpinfo->innerrel;
+		MonetdbFdwRelationInfo *fpinfo_o =
+			(MonetdbFdwRelationInfo *) outerrel->fdw_private;
+		bool		is_first = true;
+
+		deparseRangeTblRef(buf, root, outerrel,
+						   fpinfo->make_outerrel_subquery,
+						   0, NULL, context->params_list);
+
+		if (fpinfo_o->remote_conds || fpinfo->joinclauses || extra_conds)
+		{
+			appendStringInfoString(buf, " WHERE ");
+
+			if (fpinfo_o->remote_conds)
+			{
+				appendConditions(fpinfo_o->remote_conds, context);
+				is_first = false;
+			}
+
+			if (fpinfo->joinclauses)
+			{
+				if (!is_first)
+					appendStringInfoString(buf, " AND ");
+				deparseExistsSubquery(buf, root, innerrel,
+									  fpinfo->joinclauses, context);
+				is_first = false;
+			}
+
+			if (extra_conds)
+			{
+				if (!is_first)
+					appendStringInfoString(buf, " AND ");
+				appendConditions(extra_conds, context);
+			}
+		}
+	}
+	else
+	{
+		/*
+		 * Base relation or non-semi join: emit the standard FROM entry.
+		 * For base relations fpinfo->remote_conds are the rel's own filters.
+		 * For join relations the ON conditions are already embedded in the
+		 * FROM entry generated by deparseRangeTblRef.
+		 */
+		deparseRangeTblRef(buf, root, rel,
+						   IS_JOIN_REL(rel) &&
+						   (fpinfo->make_outerrel_subquery ||
+							fpinfo->make_innerrel_subquery),
+						   0, NULL, context->params_list);
+
+		{
+			List	   *all_conds = NIL;
+
+			if (IS_SIMPLE_REL(rel) && fpinfo->remote_conds)
+				all_conds = list_concat(list_copy(fpinfo->remote_conds),
+										extra_conds);
+			else
+				all_conds = extra_conds;
+
+			if (all_conds)
+			{
+				appendStringInfoString(buf, " WHERE ");
+				appendConditions(all_conds, context);
+			}
+		}
+	}
+
+	appendStringInfoChar(buf, ')');	/* close EXISTS */
 }
 
 /*
@@ -1579,6 +1843,9 @@ get_jointype_name(JoinType jointype)
 
 		case JOIN_FULL:
 			return "FULL";
+
+		case JOIN_SEMI:
+			return "SEMI";
 
 		default:
 			/* Shouldn't come here, but protect from buggy code. */
@@ -1888,8 +2155,32 @@ deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		}
 	}
 	else
-		deparseFromExprForRel(buf, root, foreignrel, true, ignore_rel,
-							  ignore_conds, params_list);
+	{
+		/*
+		 * Semi-join rels cannot be emitted as "X SEMI JOIN Y ON ..." because
+		 * that is not valid SQL.  Force the subquery path so that
+		 * deparseSelectStmtForRel → deparseFromExpr → deparseFromExprForSemiJoin
+		 * generates the correct EXISTS-based SQL.
+		 */
+		if (IS_JOIN_REL(foreignrel) && fpinfo->jointype == JOIN_SEMI)
+		{
+			List	   *retrieved_attrs;
+
+			Assert(ignore_rel == 0 ||
+				   !bms_is_member(ignore_rel, foreignrel->relids));
+			appendStringInfoChar(buf, '(');
+			deparseSelectStmtForRel(buf, root, foreignrel, NIL,
+									fpinfo->remote_conds, NIL,
+									false, false, true,
+									&retrieved_attrs, params_list);
+			appendStringInfoChar(buf, ')');
+			appendStringInfo(buf, " %s%d", SUBQUERY_REL_ALIAS_PREFIX,
+							 fpinfo->relation_index);
+		}
+		else
+			deparseFromExprForRel(buf, root, foreignrel, true, ignore_rel,
+								  ignore_conds, params_list);
+	}
 }
 
 /*
@@ -2703,6 +2994,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
 			break;
+		case T_SubPlan:
+			deparseSubPlan((SubPlan *) node, context);
+			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
 				 (int) nodeTag(node));
@@ -2937,6 +3231,9 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 	bool		first;
 	ListCell   *arg;
 
+	if (deparseExtractFuncExpr(node, context))
+		return;
+
 	/*
 	 * If the function call came from an implicit coercion, then just show the
 	 * first argument.
@@ -2986,6 +3283,54 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 		first = false;
 	}
 	appendStringInfoChar(buf, ')');
+}
+
+static bool
+deparseExtractFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	Const	   *field;
+	char	   *fieldname;
+
+	if (list_length(node->args) != 2)
+		return false;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", node->funcid);
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+	if (strcmp(NameStr(procform->proname), "extract") != 0)
+	{
+		ReleaseSysCache(proctup);
+		return false;
+	}
+
+	if (!IsA(linitial(node->args), Const))
+	{
+		ReleaseSysCache(proctup);
+		return false;
+	}
+
+	field = castNode(Const, linitial(node->args));
+	if (field->constisnull)
+	{
+		ReleaseSysCache(proctup);
+		return false;
+	}
+
+	fieldname = TextDatumGetCString(field->constvalue);
+	appendStringInfoString(buf, "EXTRACT(");
+	appendStringInfoString(buf, fieldname);
+	appendStringInfoString(buf, " FROM ");
+	deparseExpr(lsecond(node->args), context);
+	appendStringInfoChar(buf, ')');
+	pfree(fieldname);
+
+	ReleaseSysCache(proctup);
+	return true;
 }
 
 /*
@@ -3130,6 +3475,36 @@ deparseOperatorName(StringInfo buf, Form_pg_operator opform)
 	/* opname is not a SQL identifier, so we should not quote it. */
 	opname = NameStr(opform->oprname);
 
+	/*
+	 * Translate PostgreSQL LIKE/ILIKE operator symbols to standard SQL
+	 * keywords that MonetDB understands.  PostgreSQL uses internal operator
+	 * names (~~, !~~, ~~*, !~~*) that would confuse MonetDB, which maps ~~
+	 * to a geometry function.
+	 */
+	if (opform->oprnamespace == PG_CATALOG_NAMESPACE)
+	{
+		if (strcmp(opname, "~~") == 0)
+		{
+			appendStringInfoString(buf, "LIKE");
+			return;
+		}
+		if (strcmp(opname, "!~~") == 0)
+		{
+			appendStringInfoString(buf, "NOT LIKE");
+			return;
+		}
+		if (strcmp(opname, "~~*") == 0)
+		{
+			appendStringInfoString(buf, "ILIKE");
+			return;
+		}
+		if (strcmp(opname, "!~~*") == 0)
+		{
+			appendStringInfoString(buf, "NOT ILIKE");
+			return;
+		}
+	}
+
 	/* Print schema name only if it's not pg_catalog */
 	if (opform->oprnamespace != PG_CATALOG_NAMESPACE)
 	{
@@ -3183,6 +3558,17 @@ deparseScalarArrayOpExpr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
 		elog(ERROR, "cache lookup failed for operator %u", node->opno);
 	form = (Form_pg_operator) GETSTRUCT(tuple);
 
+	/*
+	 * MonetDB does not implement PostgreSQL's x = ANY('{...}') array syntax
+	 * with compatible semantics.  For literal arrays, emit IN / NOT IN
+	 * instead, which matches the originating PostgreSQL expression.
+	 */
+	if (deparseScalarArrayOpExprAsIn(node, context, form))
+	{
+		ReleaseSysCache(tuple);
+		return;
+	}
+
 	/* Sanity check. */
 	Assert(list_length(node->args) == 2);
 
@@ -3208,6 +3594,108 @@ deparseScalarArrayOpExpr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, ')');
 
 	ReleaseSysCache(tuple);
+}
+
+static bool
+deparseScalarArrayOpExprAsIn(ScalarArrayOpExpr *node,
+								 deparse_expr_cxt *context,
+								 Form_pg_operator opform)
+{
+	StringInfo	buf = context->buf;
+	Expr	   *arg1;
+	Expr	   *arg2;
+	const char *opname = NameStr(opform->oprname);
+	bool		use_in;
+	bool		first = true;
+	int			nelems = 0;
+
+	/* Support the common PostgreSQL rewrites for IN and NOT IN only. */
+	if (node->useOr)
+	{
+		if (strcmp(opname, "=") != 0)
+			return false;
+		use_in = true;
+	}
+	else
+	{
+		if (strcmp(opname, "<>") != 0)
+			return false;
+		use_in = false;
+	}
+
+	arg1 = linitial(node->args);
+	arg2 = lsecond(node->args);
+
+	appendStringInfoChar(buf, '(');
+	deparseExpr(arg1, context);
+	appendStringInfoString(buf, use_in ? " IN (" : " NOT IN (");
+
+	if (IsA(arg2, ArrayExpr))
+	{
+		ArrayExpr   *arrayexpr = castNode(ArrayExpr, arg2);
+		ListCell   *lc;
+
+		foreach(lc, arrayexpr->elements)
+		{
+			Node *elem = lfirst(lc);
+
+			if (IsA(elem, Const) && castNode(Const, elem)->constisnull)
+				return false;
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			deparseExpr((Expr *) elem, context);
+			first = false;
+			nelems++;
+		}
+	}
+	else if (IsA(arg2, Const) && type_is_array(((Const *) arg2)->consttype))
+	{
+		Const	   *arrayconst = castNode(Const, arg2);
+		ArrayType  *arr;
+		Oid			elemtype;
+		int16		elmlen;
+		bool		elembyval;
+		char		elemalign;
+		Datum	   *elem_values;
+		bool	   *elem_nulls;
+		int			i;
+
+		arr = DatumGetArrayTypeP(arrayconst->constvalue);
+		elemtype = ARR_ELEMTYPE(arr);
+		get_typlenbyvalalign(elemtype, &elmlen, &elembyval, &elemalign);
+		deconstruct_array(arr, elemtype, elmlen, elembyval, elemalign,
+						  &elem_values, &elem_nulls, &nelems);
+
+		for (i = 0; i < nelems; i++)
+		{
+			Const *elemconst;
+
+			if (elem_nulls[i])
+				return false;
+
+			elemconst = makeConst(elemtype,
+							  -1,
+							  InvalidOid,
+							  elmlen,
+							  elem_values[i],
+							  false,
+							  elembyval);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			deparseConst(elemconst, context, 0);
+			first = false;
+		}
+	}
+	else
+		return false;
+
+	if (nelems == 0)
+		return false;
+
+	appendStringInfoString(buf, "))");
+	return true;
 }
 
 /*
@@ -3463,6 +3951,128 @@ deparseAggref(Aggref *node, deparse_expr_cxt *context)
 }
 
 /*
+ * Deparse a scalar SubPlan (EXPR_SUBLINK) as an inline correlated subquery.
+ *
+ * We take the SQL template from the inner ForeignScan's fdw_private and
+ * substitute $N::typename placeholders with the corresponding outer
+ * expressions from SubPlan.args, deparsed in the outer query context.
+ *
+ * This enables the entire correlated subquery to be pushed to MonetDB as
+ * a single SQL statement instead of being evaluated row-by-row.
+ */
+static void
+deparseSubPlan(SubPlan *subplan, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	Plan	   *subplan_plan;
+	ForeignScan *fscan;
+	char	   *inner_sql;
+	const char *p;
+	int			n_fdw_exprs;
+
+	Assert(subplan->subLinkType == EXPR_SUBLINK);
+
+	/* Get the inner ForeignScan from the global subplans list */
+	subplan_plan = (Plan *) list_nth(context->root->glob->subplans,
+									 subplan->plan_id - 1);
+	Assert(IsA(subplan_plan, ForeignScan));
+	fscan = (ForeignScan *) subplan_plan;
+
+	/* The SQL template (with $N::type placeholders) is in fdw_private[0] */
+	inner_sql = strVal(linitial(fscan->fdw_private));
+	n_fdw_exprs = list_length(fscan->fdw_exprs);
+
+	/* Emit as a parenthesised scalar subquery */
+	appendStringInfoChar(buf, '(');
+
+	/*
+	 * Scan inner_sql character by character.  When we encounter $N (an
+	 * integer parameter placeholder), look up the corresponding outer
+	 * expression from SubPlan.args via the paramIds mapping and deparse it
+	 * in the outer context instead.  Skip the ::typename cast that follows.
+	 */
+	p = inner_sql;
+	while (*p)
+	{
+		if (*p == '$' && isdigit((unsigned char) *(p + 1)))
+		{
+			int			paramno = 0;
+
+			p++;					/* skip '$' */
+			while (isdigit((unsigned char) *p))
+				paramno = paramno * 10 + (*p++ - '0');
+
+			/* Skip optional ::typename cast */
+			if (p[0] == ':' && p[1] == ':')
+			{
+				p += 2;
+				/* Read base type name: letters, digits, underscore, dot */
+				while (*p && (isalnum((unsigned char) *p) ||
+							  *p == '_' || *p == '.'))
+					p++;
+				/*
+				 * Handle compound type names with a single space separator
+				 * (e.g. "double precision", "character varying").
+				 */
+				if (*p == ' ' &&
+					(pg_strncasecmp(p + 1, "precision", 9) == 0 ||
+					 pg_strncasecmp(p + 1, "varying", 7) == 0))
+				{
+					p++;		/* skip space */
+					while (*p && (isalnum((unsigned char) *p) || *p == '_'))
+						p++;
+				}
+				/* Handle typmod: (n) or (m,n) */
+				if (*p == '(')
+				{
+					p++;
+					while (*p && *p != ')')
+						p++;
+					if (*p)
+						p++;	/* skip closing ')' */
+				}
+			}
+
+			/* Substitute with the corresponding outer expression */
+			if (paramno >= 1 && paramno <= n_fdw_exprs)
+			{
+				/*
+				 * $N in the inner SQL corresponds to fdw_exprs[N-1], which
+				 * is a PARAM_EXEC node.  Find the matching entry in
+				 * SubPlan.paramIds and use the corresponding SubPlan.args
+				 * expression (which is the outer Var/expression) deparsed
+				 * in the outer context.
+				 */
+				Param	   *param = (Param *) list_nth(fscan->fdw_exprs,
+													   paramno - 1);
+				ListCell   *lc_id;
+				ListCell   *lc_arg;
+				bool		found = false;
+
+				forboth(lc_id, subplan->parParam,
+						lc_arg, subplan->args)
+				{
+					if (lfirst_int(lc_id) == param->paramid)
+					{
+						deparseExpr((Expr *) lfirst(lc_arg), context);
+						found = true;
+						break;
+					}
+				}
+				if (!found)
+					appendStringInfo(buf, "$%d", paramno);
+			}
+			else
+				appendStringInfo(buf, "$%d", paramno);
+		}
+		else
+			appendStringInfoChar(buf, *p++);
+	}
+
+	appendStringInfoChar(buf, ')');
+}
+
+/*
  * Append ORDER BY within aggregate function.
  */
 static void
@@ -3628,6 +4238,7 @@ appendGroupByClause(List *tlist, deparse_expr_cxt *context)
  */
 static void
 appendOrderByClause(List *pathkeys, bool has_final_sort,
+					List *targetList,
 					deparse_expr_cxt *context)
 {
 	ListCell   *lcell;
@@ -3644,6 +4255,8 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 		EquivalenceMember *em;
 		Expr	   *em_expr;
 		Oid			oprid;
+		TargetEntry *matching_tle = NULL;
+		ListCell   *tlc;
 
 		if (has_final_sort)
 		{
@@ -3715,7 +4328,28 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 				 pathkey->pk_opfamily);
 #endif
 
-		deparseExpr(em_expr, context);
+		/*
+		 * MonetDB is happier when grouped upper queries sort by select-list
+		 * position instead of repeating the grouping expression.
+		 */
+		if (IS_UPPER_REL(context->foreignrel) && targetList != NIL)
+		{
+			foreach(tlc, targetList)
+			{
+				TargetEntry *tle = lfirst_node(TargetEntry, tlc);
+
+				if (!tle->resjunk && equal(em_expr, tle->expr))
+				{
+					matching_tle = tle;
+					break;
+				}
+			}
+		}
+
+		if (matching_tle)
+			appendStringInfo(buf, "%d", matching_tle->resno);
+		else
+			deparseExpr(em_expr, context);
 
 		/*
 		 * Here we need to use the expression's actual type to discover

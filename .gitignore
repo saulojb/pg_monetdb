@@ -2,6 +2,7 @@
 /.deps/
 /*.o
 /*.so
+/*.bc
 /log/
 /results/
 /tmp_check/
