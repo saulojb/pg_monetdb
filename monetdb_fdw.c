@@ -73,7 +73,9 @@ PG_MODULE_MAGIC;
 
 static planner_hook_type next_planner_hook = NULL;
 static create_upper_paths_hook_type next_create_upper_paths_hook = NULL;
+static set_join_pathlist_hook_type next_set_join_pathlist_hook = NULL;
 static bool pg_monetdb_enable_planner_hook_debug = false;
+static int pg_monetdb_trace_active_depth = 0;
 
 typedef struct PgMonetdbPlannerTraceContext
 {
@@ -89,6 +91,12 @@ static void pg_monetdb_create_upper_paths(PlannerInfo *root,
 									 RelOptInfo *input_rel,
 									 RelOptInfo *output_rel,
 									 void *extra);
+static void pg_monetdb_set_join_pathlist(PlannerInfo *root,
+									 RelOptInfo *joinrel,
+									 RelOptInfo *outerrel,
+									 RelOptInfo *innerrel,
+									 JoinType jointype,
+									 JoinPathExtraData *extra);
 static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 										 const char *query_string);
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
@@ -196,6 +204,8 @@ _PG_init(void)
 	planner_hook = pg_monetdb_planner;
 	next_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = pg_monetdb_create_upper_paths;
+	next_set_join_pathlist_hook = set_join_pathlist_hook;
+	set_join_pathlist_hook = pg_monetdb_set_join_pathlist;
 }
 
 void
@@ -205,16 +215,24 @@ _PG_fini(void)
 		planner_hook = next_planner_hook;
 	if (create_upper_paths_hook == pg_monetdb_create_upper_paths)
 		create_upper_paths_hook = next_create_upper_paths_hook;
+	if (set_join_pathlist_hook == pg_monetdb_set_join_pathlist)
+		set_join_pathlist_hook = next_set_join_pathlist_hook;
 }
 
 static PlannedStmt *
 pg_monetdb_planner(Query *parse, const char *query_string,
 				   int cursorOptions, ParamListInfo boundParams)
 {
+	bool		trace_active = false;
+	PlannedStmt *result;
+
 	if (pg_monetdb_enable_planner_hook_debug &&
 		pg_monetdb_query_needs_planner_trace(parse, query_string))
 	{
 		PgMonetdbPlannerTraceContext trace_context;
+
+		trace_active = true;
+		pg_monetdb_trace_active_depth++;
 
 		memset(&trace_context, 0, sizeof(trace_context));
 		query_tree_walker(parse, pg_monetdb_find_grouped_any_sublink,
@@ -242,9 +260,14 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 	}
 
 	if (next_planner_hook)
-		return next_planner_hook(parse, query_string, cursorOptions, boundParams);
+		result = next_planner_hook(parse, query_string, cursorOptions, boundParams);
+	else
+		result = standard_planner(parse, query_string, cursorOptions, boundParams);
 
-	return standard_planner(parse, query_string, cursorOptions, boundParams);
+	if (trace_active)
+		pg_monetdb_trace_active_depth--;
+
+	return result;
 }
 
 static void
@@ -271,6 +294,34 @@ pg_monetdb_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 	if (next_create_upper_paths_hook)
 		next_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
+}
+
+static void
+pg_monetdb_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+					 RelOptInfo *outerrel, RelOptInfo *innerrel,
+					 JoinType jointype, JoinPathExtraData *extra)
+{
+	if (pg_monetdb_enable_planner_hook_debug &&
+		pg_monetdb_trace_active_depth > 0 &&
+		root != NULL && root->parse != NULL)
+	{
+		elog(DEBUG1,
+			 "pg_monetdb join hook: jointype=%d outerkind=%d innerkind=%d joinkind=%d outerfdw=%s innerfdw=%s joinfdw=%s joinrelids=%s outerrelids=%s innerrelids=%s",
+			 jointype,
+			 outerrel != NULL ? outerrel->reloptkind : -1,
+			 innerrel != NULL ? innerrel->reloptkind : -1,
+			 joinrel != NULL ? joinrel->reloptkind : -1,
+			 outerrel != NULL && outerrel->fdw_private != NULL ? "true" : "false",
+			 innerrel != NULL && innerrel->fdw_private != NULL ? "true" : "false",
+			 joinrel != NULL && joinrel->fdw_private != NULL ? "true" : "false",
+			 joinrel != NULL && joinrel->relids != NULL ? bmsToString(joinrel->relids) : "<null>",
+			 outerrel != NULL && outerrel->relids != NULL ? bmsToString(outerrel->relids) : "<null>",
+			 innerrel != NULL && innerrel->relids != NULL ? bmsToString(innerrel->relids) : "<null>");
+	}
+
+	if (next_set_join_pathlist_hook)
+		next_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+						   jointype, extra);
 }
 
 static bool
