@@ -74,12 +74,21 @@ PG_MODULE_MAGIC;
 static planner_hook_type next_planner_hook = NULL;
 static bool pg_monetdb_enable_planner_hook_debug = false;
 
+typedef struct PgMonetdbPlannerTraceContext
+{
+	SubLink    *grouped_any_sublink;
+} PgMonetdbPlannerTraceContext;
+
 static PlannedStmt *pg_monetdb_planner(Query *parse,
 									  const char *query_string,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 										 const char *query_string);
+static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
+static void pg_monetdb_log_query_shape(Query *query, const char *label);
+static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
+static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
@@ -194,11 +203,31 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 	if (pg_monetdb_enable_planner_hook_debug &&
 		pg_monetdb_query_needs_planner_trace(parse, query_string))
 	{
+		PgMonetdbPlannerTraceContext trace_context;
+
+		memset(&trace_context, 0, sizeof(trace_context));
+		query_tree_walker(parse, pg_monetdb_find_grouped_any_sublink,
+					  &trace_context, 0);
+
 		elog(DEBUG1,
 			 "pg_monetdb planner hook reached: hasSubLinks=%s hasAggs=%s commandType=%d",
 			 parse->hasSubLinks ? "true" : "false",
 			 parse->hasAggs ? "true" : "false",
 			 parse->commandType);
+		pg_monetdb_log_query_shape(parse, "root");
+
+		if (trace_context.grouped_any_sublink != NULL)
+		{
+			Query	   *subquery = (Query *) trace_context.grouped_any_sublink->subselect;
+
+			elog(DEBUG1,
+				 "pg_monetdb grouped sublink: type=%s testexpr=%s groupClauseLen=%d hasAggs=%s",
+				 pg_monetdb_sublink_name(trace_context.grouped_any_sublink->subLinkType),
+				 trace_context.grouped_any_sublink->testexpr != NULL ? "true" : "false",
+				 list_length(subquery->groupClause),
+				 subquery->hasAggs ? "true" : "false");
+			pg_monetdb_log_query_shape(subquery, "sublink");
+		}
 	}
 
 	if (next_planner_hook)
@@ -221,6 +250,127 @@ pg_monetdb_query_needs_planner_trace(Query *parse, const char *query_string)
 		return true;
 
 	return false;
+}
+
+static bool
+pg_monetdb_find_grouped_any_sublink(Node *node, void *context)
+{
+	PgMonetdbPlannerTraceContext *trace_context =
+		(PgMonetdbPlannerTraceContext *) context;
+
+	if (node == NULL || trace_context->grouped_any_sublink != NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sublink = (SubLink *) node;
+
+		if (sublink->subLinkType == ANY_SUBLINK &&
+			IsA(sublink->subselect, Query) &&
+			((Query *) sublink->subselect)->groupClause != NIL)
+		{
+			trace_context->grouped_any_sublink = sublink;
+			return true;
+		}
+	}
+
+	return expression_tree_walker(node, pg_monetdb_find_grouped_any_sublink,
+						  context);
+}
+
+static void
+pg_monetdb_log_query_shape(Query *query, const char *label)
+{
+	int			index = 1;
+	ListCell   *lc;
+
+	if (query == NULL)
+		return;
+
+	elog(DEBUG1,
+		 "pg_monetdb %s query shape: rtable=%d jointree=%s targetlist=%d groupClause=%d hasSubLinks=%s hasAggs=%s",
+		 label,
+		 list_length(query->rtable),
+		 query->jointree != NULL ? nodeToString((Node *) query->jointree->fromlist) : "false",
+		 list_length(query->targetList),
+		 list_length(query->groupClause),
+		 query->hasSubLinks ? "true" : "false",
+		 query->hasAggs ? "true" : "false");
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		const char *relname = NULL;
+
+		if (rte->rtekind == RTE_RELATION)
+			relname = get_rel_name(rte->relid);
+
+		elog(DEBUG1,
+			 "pg_monetdb %s rte[%d]: kind=%s relid=%u relname=%s subquery=%s",
+			 label,
+			 index,
+			 pg_monetdb_rtekind_name(rte->rtekind),
+			 rte->relid,
+			 relname != NULL ? relname : "<none>",
+			 rte->subquery != NULL ? "true" : "false");
+		index++;
+	}
+}
+
+static const char *
+pg_monetdb_rtekind_name(RTEKind rtekind)
+{
+	switch (rtekind)
+	{
+		case RTE_RELATION:
+			return "RTE_RELATION";
+		case RTE_SUBQUERY:
+			return "RTE_SUBQUERY";
+		case RTE_JOIN:
+			return "RTE_JOIN";
+		case RTE_FUNCTION:
+			return "RTE_FUNCTION";
+		case RTE_TABLEFUNC:
+			return "RTE_TABLEFUNC";
+		case RTE_VALUES:
+			return "RTE_VALUES";
+		case RTE_CTE:
+			return "RTE_CTE";
+		case RTE_NAMEDTUPLESTORE:
+			return "RTE_NAMEDTUPLESTORE";
+		case RTE_GROUP:
+			return "RTE_GROUP";
+		case RTE_RESULT:
+			return "RTE_RESULT";
+	}
+
+	return "RTE_UNKNOWN";
+}
+
+static const char *
+pg_monetdb_sublink_name(SubLinkType sublink_type)
+{
+	switch (sublink_type)
+	{
+		case EXISTS_SUBLINK:
+			return "EXISTS_SUBLINK";
+		case ALL_SUBLINK:
+			return "ALL_SUBLINK";
+		case ANY_SUBLINK:
+			return "ANY_SUBLINK";
+		case ROWCOMPARE_SUBLINK:
+			return "ROWCOMPARE_SUBLINK";
+		case EXPR_SUBLINK:
+			return "EXPR_SUBLINK";
+		case MULTIEXPR_SUBLINK:
+			return "MULTIEXPR_SUBLINK";
+		case ARRAY_SUBLINK:
+			return "ARRAY_SUBLINK";
+		case CTE_SUBLINK:
+			return "CTE_SUBLINK";
+	}
+
+	return "UNKNOWN_SUBLINK";
 }
 
 /*
