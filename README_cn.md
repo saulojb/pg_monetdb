@@ -1,18 +1,16 @@
 [English version](README.md)
 
-## monetdb\_fdw
+## pg\_monetdb
 
-MonetDB\_fdw 是基于 Foreign Data Wrapper （FDW） 技术的 PostgreSQL 扩展，可以用来增强`PostgreSQL`的分析能力。
+pg\_monetdb 是基于 Foreign Data Wrapper （FDW） 技术的 PostgreSQL 扩展，可以用来增强`PostgreSQL`的分析能力。
 本项目基于优秀的`postgres_fdw`[https://www.postgresql.org/docs/current/postgres-fdw.html](https://www.postgresql.org/docs/current/postgres-fdw.html)和 `oracle_fdw`([https://github.com/laurenz/oracle\_fdw.git](https://github.com/laurenz/oracle_fdw.git))项目。
 
-#### 支持的操作系统和数据库
 
 * RHEL 8/9、CentOS 8/9，Ubuntu
 * 羲和（Halo）数据库 1.0.14, 1.0.16
 * PostgreSQL 14至18版本
-* MonetDB 11.56（master版本）
+* MonetDB 11.55.5（last）
 
-#### 源码编译安装
 
 在PGXS上构建
 
@@ -21,8 +19,8 @@ export USE_PGXS=1
 export MONETDB_HOME=<MonetDB installation path>
 export PATH=$MONETDB_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
-git clone https://github.com/HaloTech-Co-Ltd/MonetDB_fdw.git
-cd MonetDB_fdw
+git clone https://github.com/saulojb/pg_monetdb.git
+cd pg_monetdb
 make && make install
 ```
 
@@ -32,22 +30,22 @@ make && make install
 export MONETDB_HOME=<MonetDB installation path>
 export PATH=$MONETDB_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
-git clone https://github.com/HaloTech-Co-Ltd/MonetDB_fdw.git <PostgreSQL contrib source path>
-cd <PostgreSQL contrib source path>/MonetDB_fdw
+git clone https://github.com/saulojb/pg_monetdb.git <PostgreSQL contrib source path>/pg_monetdb
+cd <PostgreSQL contrib source path>/pg_monetdb
 make && make install
 ```
 
 #### 快速上手
 
-* 创建MonetDB_fdw拓展插件
+* 创建pg_monetdb拓展插件
 
   ```sql
-  CREATE EXTENSION monetdb_fdw;
+  CREATE EXTENSION pg_monetdb;
   ```
 * 创建外部服务器
 
   ```sql
-  CREATE SERVER foreign_server FOREIGN DATA WRAPPER monetdb_fdw
+  CREATE SERVER foreign_server FOREIGN DATA WRAPPER pg_monetdb
   OPTIONS (host '127.0.0.1', port '50000', dbname 'test');
   ```
 * 创建用户映射
@@ -55,10 +53,10 @@ make && make install
   ```sql
   CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server OPTIONS (user 'zm', password 'zm');
   ```
-* 在MonetDB中创建一张名为emp的表，这里我们可以使用`monetdb\_execute`帮助我们快速实现
+* 在MonetDB中创建一张名为emp的表，这里我们可以使用`pg\_monetdb\_execute`帮助我们快速实现
 
   ```sql
-  SELECT monetdb_execute('foreign_server', $$CREATE TABLE emp(
+    SELECT pg_monetdb_execute('foreign_server', $$CREATE TABLE emp(
         name VARCHAR(20),
         age INTEGER
   )$$);

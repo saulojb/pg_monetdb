@@ -289,7 +289,7 @@ FROM pg_foreign_table ft
      JOIN pg_foreign_server s ON s.oid = ft.ftserver
 WHERE c.relname = 'url_example';
 
-INSERT INTO url_example VALUES('https://github.com/Z-Xiao-M/MonetDB_fdw', 'https://github.com/Z-Xiao-M/MonetDB_fdw');
+INSERT INTO url_example VALUES('https://github.com/saulojb/pg_monetdb', 'https://github.com/saulojb/pg_monetdb');
 SELECT * FROM URL_example;
 DROP FOREIGN TABLE URL_example;
 SELECT monetdb_execute('foreign_server', $$DROP TABLE URL_example$$);

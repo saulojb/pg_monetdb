@@ -1,5 +1,5 @@
-# monetdb_fdw extension
+# pg_monetdb extension
 comment = 'foreign-data wrapper for remote MonetDB databases'
 default_version = '1.0'
-module_pathname = '$libdir/monetdb_fdw'
+module_pathname = '$libdir/pg_monetdb'
 relocatable = true

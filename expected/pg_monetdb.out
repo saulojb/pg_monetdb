@@ -1,38 +1,38 @@
 -- !!! If you want to run regression tests, you need to create a database named "test" in MonetDB with the default port 50000.
 SET timezone = 'UTC';
-CREATE EXTENSION monetdb_fdw;
-CREATE SERVER foreign_server FOREIGN DATA WRAPPER monetdb_fdw
+CREATE EXTENSION pg_monetdb;
+CREATE SERVER foreign_server FOREIGN DATA WRAPPER pg_monetdb
 OPTIONS (host '127.0.0.1', port '50000', dbname 'test');
 CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server OPTIONS (user 'monetdb', password 'monetdb');
-SELECT monetdb_execute('foreign_server', $$DROP USER test_u$$);
+SELECT pg_monetdb_execute('foreign_server', $$DROP USER test_u$$);
 ERROR:  [MonetDB RESULT ERROR] DROP USER: no such user role 'test_u'
 
-SELECT monetdb_execute('foreign_server', $$DROP SCHEMA test_u$$);
+SELECT pg_monetdb_execute('foreign_server', $$DROP SCHEMA test_u$$);
 ERROR:  [MonetDB RESULT ERROR] DROP SCHEMA: name test_u does not exist
 
-SELECT monetdb_execute('foreign_server', $$CREATE USER "test_u" WITH PASSWORD 'test_u' NAME 'test_user' SCHEMA "sys"$$);
- monetdb_execute 
------------------
+SELECT pg_monetdb_execute('foreign_server', $$CREATE USER "test_u" WITH PASSWORD 'test_u' NAME 'test_user' SCHEMA "sys"$$);
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 
-SELECT monetdb_execute('foreign_server', $$CREATE SCHEMA IF NOT EXISTS "test_u" AUTHORIZATION "test_u"$$);
- monetdb_execute 
------------------
+SELECT pg_monetdb_execute('foreign_server', $$CREATE SCHEMA IF NOT EXISTS "test_u" AUTHORIZATION "test_u"$$);
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 
-SELECT monetdb_execute('foreign_server', $$ALTER USER "test_u" SET SCHEMA "test_u"$$);
- monetdb_execute 
------------------
+SELECT pg_monetdb_execute('foreign_server', $$ALTER USER "test_u" SET SCHEMA "test_u"$$);
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 
 DROP USER MAPPING FOR CURRENT_USER SERVER foreign_server;
 CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server OPTIONS (user 'test_u', password 'test_u');
-SELECT monetdb_execute('foreign_server', $$CREATE TABLE emp( name VARCHAR(20), age INTEGER)$$);
- monetdb_execute 
------------------
+SELECT pg_monetdb_execute('foreign_server', $$CREATE TABLE emp( name VARCHAR(20), age INTEGER)$$);
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 
@@ -49,7 +49,7 @@ FROM pg_catalog.pg_foreign_server s
 ORDER BY 1;
       Name      | Foreign-data wrapper 
 ----------------+----------------------
- foreign_server | monetdb_fdw
+ foreign_server | pg_monetdb
 (1 row)
 
 -- Verify foreign table is correctly created
@@ -76,14 +76,14 @@ SELECT * FROM emp;
  Mary |  22
 (2 rows)
 
-SELECT monetdb_execute('foreign_server', $$SELECT * FROM emp$$);
+SELECT pg_monetdb_execute('foreign_server', $$SELECT * FROM emp$$);
 INFO:  
 name,age
 [ "John",	23	]
 [ "Mary",	22	]
 
- monetdb_execute 
------------------
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 
@@ -112,9 +112,9 @@ SELECT * FROM emp;
 ------+-----
 (0 rows)
 
-SELECT monetdb_execute('foreign_server', $$CREATE TABLE delete_emp(name VARCHAR(20) PRIMARY KEY, age INTEGER)$$);
- monetdb_execute 
------------------
+SELECT pg_monetdb_execute('foreign_server', $$CREATE TABLE delete_emp(name VARCHAR(20) PRIMARY KEY, age INTEGER)$$);
+ pg_monetdb_execute 
+--------------------
  
 (1 row)
 

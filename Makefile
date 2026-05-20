@@ -1,6 +1,6 @@
-# Makefile for MonetDB_fdw
+# Makefile for pg_monetdb
 
-MODULE_big = monetdb_fdw
+MODULE_big = pg_monetdb
 OBJS = \
 	$(WIN32RES)   \
 	deparse.o 	  \
@@ -8,7 +8,7 @@ OBJS = \
 	shippable.o   \
 	connection.o
 
-PGFILEDESC = "MonetDB_fdw - foreign data wrapper for MonetDB"
+PGFILEDESC = "pg_monetdb - foreign data wrapper for MonetDB"
 
 # MonetDB installation paths.
 # Override MONETDB_HOME to point at a non-standard installation, e.g.:
@@ -31,10 +31,10 @@ MAPI_LIBDIR  := $(dir $(MAPI_LIB))
 PG_CPPFLAGS  += -I"$(MONETDB_INCLUDE)"
 SHLIB_LINK   += -L"$(MAPI_LIBDIR)" -l"$(MAPI_LIBNAME)" -Wl,-rpath,"$(MAPI_LIBDIR)"
 
-EXTENSION = monetdb_fdw
-DATA = monetdb_fdw--1.0.sql
+EXTENSION = pg_monetdb
+DATA = pg_monetdb--1.0.sql
 
-REGRESS = monetdb_fdw type_support
+REGRESS = pg_monetdb type_support
 
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config

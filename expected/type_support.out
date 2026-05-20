@@ -469,11 +469,11 @@ WHERE c.relname = 'url_example';
  url_example | foreign_server | schema_name=test_u, table_name=url_example
 (1 row)
 
-INSERT INTO url_example VALUES('https://github.com/Z-Xiao-M/MonetDB_fdw', 'https://github.com/Z-Xiao-M/MonetDB_fdw');
+INSERT INTO url_example VALUES('https://github.com/saulojb/pg_monetdb', 'https://github.com/saulojb/pg_monetdb');
 SELECT * FROM URL_example;
                    c1                    |                   c2                    
 -----------------------------------------+-----------------------------------------
- https://github.com/Z-Xiao-M/MonetDB_fdw | https://github.com/Z-Xiao-M/MonetDB_fdw
+ https://github.com/saulojb/pg_monetdb | https://github.com/saulojb/pg_monetdb
 (1 row)
 
 DROP FOREIGN TABLE URL_example;

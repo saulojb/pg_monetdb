@@ -1,8 +1,8 @@
 [简体中文版](README_cn.md)
 
-## MonetDB_fdw
+## pg_monetdb
 
-MonetDB_fdw is a PostgreSQL extension based on Foreign Data Wrapper (FDW) technology, which can enhance PostgreSQL analytical capabilities.
+pg_monetdb is a PostgreSQL extension based on Foreign Data Wrapper (FDW) technology, which can enhance PostgreSQL analytical capabilities.
 
 The work based on the excellent oracle_fdw (https://github.com/laurenz/oracle_fdw.git) & postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html) projects.
 
@@ -24,8 +24,8 @@ export USE_PGXS=1
 export MONETDB_HOME=<MonetDB installation path>
 export PATH=$MONETDB_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
-git clone https://github.com/HaloTech-Co-Ltd/MonetDB_fdw.git
-cd MonetDB_fdw
+git clone https://github.com/saulojb/pg_monetdb.git
+cd pg_monetdb
 make && make install
 ```
 
@@ -35,23 +35,23 @@ make && make install
 export MONETDB_HOME=<MonetDB installation path>
 export PATH=$MONETDB_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
-git clone https://github.com/HaloTech-Co-Ltd/MonetDB_fdw.git <PostgreSQL contrib source path>
-cd <PostgreSQL contrib source path>/MonetDB_fdw
+git clone https://github.com/saulojb/pg_monetdb.git <PostgreSQL contrib source path>/pg_monetdb
+cd <PostgreSQL contrib source path>/pg_monetdb
 make && make install
 ```
 
 #### Quick Tutorial
 
-* Create MonetDB_fdw extension
+* Create pg_monetdb extension
 
 ```sql
-CREATE EXTENSION monetdb_fdw;
+CREATE EXTENSION pg_monetdb;
 ```
 
 * Create foreign server
 
 ```sql
-CREATE SERVER foreign_server FOREIGN DATA WRAPPER monetdb_fdw
+CREATE SERVER foreign_server FOREIGN DATA WRAPPER pg_monetdb
 OPTIONS (host '127.0.0.1', port '50000', dbname 'test');
 ```
 
@@ -61,10 +61,10 @@ OPTIONS (host '127.0.0.1', port '50000', dbname 'test');
 CREATE USER MAPPING FOR CURRENT_USER SERVER foreign_server OPTIONS (user 'zm', password 'zm');
 ```
 
-* Create table (emp for a example) in MonetDB using monetdb_execute function
+* Create table (emp for a example) in MonetDB using pg_monetdb_execute function
 
 ```sql
-SELECT monetdb_execute('foreign_server', $$CREATE TABLE emp(
+SELECT pg_monetdb_execute('foreign_server', $$CREATE TABLE emp(
         name VARCHAR(20),
         age INTEGER
 )$$);
