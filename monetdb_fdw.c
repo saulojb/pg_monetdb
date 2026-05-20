@@ -208,6 +208,7 @@ enum FdwDirectModifyPrivateIndex
 	FdwDirectModifyPrivateSetProcessed
 };
 
+
 void
 _PG_init(void)
 {
@@ -5828,6 +5829,8 @@ make_tuple_from_result_row(MapiHdl res,
 	TupleDesc	tupdesc;
 	Datum	   *values;
 	bool	   *nulls;
+	int			field_count;
+	int			retrieved_count;
 	ConversionLocation errpos;
 	ErrorContextCallback errcallback;
 	MemoryContext oldcontext;
@@ -5853,6 +5856,29 @@ make_tuple_from_result_row(MapiHdl res,
 	{
 		Assert(fsstate);
 		tupdesc = fsstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	}
+
+	field_count = mapi_get_field_count(res);
+	retrieved_count = list_length(retrieved_attrs);
+
+	if (retrieved_count > 0 && field_count != retrieved_count)
+		elog(ERROR,
+			   "remote query result shape mismatch: expected %d columns but MonetDB returned %d",
+			   retrieved_count, field_count);
+
+	if (fsstate != NULL && rel == NULL)
+	{
+		ForeignScan *fsplan = castNode(ForeignScan, fsstate->ss.ps.plan);
+		int			scan_tlist_len = list_length(fsplan->fdw_scan_tlist);
+
+		if (scan_tlist_len != retrieved_count)
+			elog(ERROR,
+				   "foreign join scan targetlist mismatch: fdw_scan_tlist has %d entries but retrieved_attrs has %d",
+				   scan_tlist_len, retrieved_count);
+		if (tupdesc->natts != scan_tlist_len)
+			elog(ERROR,
+				   "foreign join tuple descriptor mismatch: scan tuple has %d attrs but fdw_scan_tlist has %d",
+				   tupdesc->natts, scan_tlist_len);
 	}
 
 	values = (Datum *) palloc0(tupdesc->natts * sizeof(Datum));
@@ -6003,6 +6029,10 @@ conversion_error_callback(void *arg)
 		{
 			/* error occurred in a scan against a foreign join */
 			TargetEntry *tle;
+			int			fdw_scan_tlist_len = list_length(fsplan->fdw_scan_tlist);
+
+			if (errpos->cur_attno <= 0 || errpos->cur_attno > fdw_scan_tlist_len)
+				return;
 
 			tle = list_nth_node(TargetEntry, fsplan->fdw_scan_tlist,
 								errpos->cur_attno - 1);
@@ -6745,15 +6775,6 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 
 	if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
 		!fpinfo_i || !fpinfo_i->pushdown_safe)
-		return false;
-
-	/*
-	 * Nested ANTI pushdown is currently unsafe for MonetDB runtime behavior.
-	 * Although alternative remote shapes can be much faster, the current
-	 * experimental implementation is not executor-safe yet. Keep ANTI joins
-	 * local until we have a proven remote path.
-	 */
-	if (jointype == JOIN_ANTI)
 		return false;
 
 	/*

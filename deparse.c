@@ -178,6 +178,7 @@ static void deparseFromExprForRel(StringInfo buf, PlannerInfo *root,
 								  List **params_list);
 static void deparseFromExpr(List *quals, deparse_expr_cxt *context);
 static void deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context);
+static AttrNumber find_null_test_attno(RelOptInfo *rel, List *exprs);
 static void deparseExistsSubquery(StringInfo buf, PlannerInfo *root,
 								  RelOptInfo *rel, List *extra_conds,
 								  bool negated,
@@ -1614,6 +1615,35 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	 * EXISTS/NOT EXISTS (SELECT 1 FROM inner WHERE joinclauses [AND inner_conds]).
  * Any additional quals (pushed-down upper-rel conditions) are added to WHERE.
  */
+static AttrNumber
+find_null_test_attno(RelOptInfo *rel, List *exprs)
+{
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+		List	   *vars;
+		ListCell   *vlc;
+
+		if (IsA(node, RestrictInfo))
+			node = (Node *) ((RestrictInfo *) node)->clause;
+
+		vars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+							 PVC_RECURSE_PLACEHOLDERS);
+
+		foreach(vlc, vars)
+		{
+			Var	   *var = lfirst_node(Var, vlc);
+
+			if (bms_is_member(var->varno, rel->relids) && var->varattno > 0)
+				return var->varattno;
+		}
+	}
+
+	return InvalidAttrNumber;
+}
+
 static void
 deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 {
@@ -1625,8 +1655,48 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 	RelOptInfo *innerrel = fpinfo->innerrel;
 	MonetdbFdwRelationInfo *fpinfo_o =
 		(MonetdbFdwRelationInfo *) outerrel->fdw_private;
+	MonetdbFdwRelationInfo *fpinfo_i =
+		(MonetdbFdwRelationInfo *) innerrel->fdw_private;
 	bool		negated = (fpinfo->jointype == JOIN_ANTI);
 	bool		is_first = true;
+	AttrNumber	null_attno = InvalidAttrNumber;
+
+	if (negated && IS_SIMPLE_REL(innerrel) && !fpinfo->make_innerrel_subquery)
+	{
+		null_attno = find_null_test_attno(innerrel, fpinfo->joinclauses);
+		if (null_attno == InvalidAttrNumber)
+			null_attno = find_null_test_attno(innerrel, fpinfo_i->remote_conds);
+	}
+
+	if (negated && null_attno != InvalidAttrNumber && fpinfo->make_outerrel_subquery)
+	{
+		RangeTblEntry *inner_rte = planner_rt_fetch(innerrel->relid,
+									   context->root);
+
+		deparseRangeTblRef(buf, context->root, outerrel,
+					   fpinfo->make_outerrel_subquery,
+					   0, NULL, context->params_list);
+		appendStringInfoString(buf, " LEFT JOIN ");
+		deparseRangeTblRef(buf, context->root, innerrel, false,
+					   0, NULL, context->params_list);
+		appendStringInfoString(buf, " ON ");
+		appendConditions(fpinfo->joinclauses, context);
+		if (fpinfo_i->remote_conds)
+		{
+			appendStringInfoString(buf, " AND ");
+			appendConditions(fpinfo_i->remote_conds, context);
+		}
+
+		appendStringInfoString(buf, " WHERE ");
+		if (quals)
+		{
+			appendConditions(quals, context);
+			appendStringInfoString(buf, " AND ");
+		}
+		deparseColumnRef(buf, innerrel->relid, null_attno, inner_rte, true);
+		appendStringInfoString(buf, " IS NULL");
+		return;
+	}
 
 	/* Emit the outer relation's FROM entry */
 	deparseRangeTblRef(buf, context->root, outerrel,
@@ -1701,8 +1771,8 @@ deparseExistsSubquery(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 		bool		is_first = true;
 
 		deparseRangeTblRef(buf, root, outerrel,
-						   fpinfo->make_outerrel_subquery,
-						   0, NULL, context->params_list);
+					   fpinfo->make_outerrel_subquery,
+					   0, NULL, context->params_list);
 
 		if (fpinfo_o->remote_conds || fpinfo->joinclauses || extra_conds)
 		{

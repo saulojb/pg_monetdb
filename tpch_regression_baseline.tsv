@@ -19,5 +19,5 @@ Q17	OK	40.268	FS	validated isolated; single Foreign Scan
 Q18	OK	354.942	FS	canonical all.sql matrix; grouped-subquery join pushdown active
 Q19	OK	34.557	FS	validated isolated; single Foreign Scan
 Q20	OK	279.714	FS+LOCAL_SORT	validated isolated; remote query with local top sort
-Q21	ISSUE	4560.429	FS+LOCAL_ANTI_JOIN	canonical all.sql matrix after disabling remote JOIN_ANTI pushdown; EXISTS stays remote, NOT EXISTS remains local over 3.79M rows
-Q22	ISSUE	1515.000	MIXED	remote initplan plus local anti-join finished correctly
+Q21	OK	68.842	FS	canonical all.sql matrix with remote JOIN_ANTI rewritten as s27 LEFT JOIN ... IS NULL; single Foreign Scan
+Q22	OK	37.932	FS+INITPLAN+LOCAL_AGG	canonical all.sql matrix; remote InitPlan and remote NOT EXISTS feed local aggregate
