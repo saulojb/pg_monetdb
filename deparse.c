@@ -2071,12 +2071,13 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	else
 	{
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+		Relation	rel;
 
 		/*
 		 * Core code already has some lock on each rel being planned, so we
 		 * can use NoLock here.
 		 */
-		Relation	rel = table_open(rte->relid, NoLock);
+		rel = table_open(rte->relid, NoLock);
 
 		deparseRelation(buf, rel);
 

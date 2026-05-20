@@ -108,6 +108,7 @@ static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
 static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
 										 Oid *relid_out);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
+									   Index rti,
 									   Oid relid);
 static void pg_monetdb_log_query_shape(Query *query, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
@@ -317,7 +318,7 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
 		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
-		pg_monetdb_attach_grouped_subquery_fpinfo(rel, derived_relid);
+		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, derived_relid);
 
 	if (pg_monetdb_enable_planner_hook_debug &&
 		root != NULL && root->parse != NULL &&
@@ -380,7 +381,7 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 }
 
 static void
-pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Oid relid)
+pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Index rti, Oid relid)
 {
 	ForeignTable *table;
 	ForeignServer *server;
@@ -400,6 +401,7 @@ pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Oid relid)
 	fpinfo->table = table;
 	fpinfo->server = server;
 	fpinfo->user = user;
+	fpinfo->relation_index = rti;
 	fpinfo->relation_name = psprintf("Grouped subquery on (%s)",
 						 get_rel_name(relid));
 	fpinfo->retrieved_rows = -1;
