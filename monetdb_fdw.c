@@ -3315,10 +3315,21 @@ MonetDB_EndDirectModify(ForeignScanState *node)
 static void
 MonetDB_ExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	MonetdbFdwScanState *fsstate = (MonetdbFdwScanState *) node->fdw_state;
+	const char *query = NULL;
+
+	if (fsplan != NULL &&
+		list_length(fsplan->fdw_private) > FdwScanPrivateSelectSql &&
+		IsA(list_nth(fsplan->fdw_private, FdwScanPrivateSelectSql), String))
+		query = strVal(list_nth(fsplan->fdw_private, FdwScanPrivateSelectSql));
+
+	if (query == NULL && fsstate != NULL)
+		query = fsstate->query;
 
 	/* Show the SQL query that will be sent to MonetDB */
-	ExplainPropertyText("MonetDB query", fsstate->query, es);
+	if (query != NULL)
+		ExplainPropertyText("MonetDB query", query, es);
 }
 
 /*
