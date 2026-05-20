@@ -3258,6 +3258,24 @@ estimate_path_cost_size(PlannerInfo *root,
 	Assert(foreignrel->reltarget);
 
 	/*
+	 * Some upper-planner paths can reach here before the relation has valid
+	 * FDW private state.  Treat those as non-pushdown candidates instead of
+	 * dereferencing a null fpinfo and crashing the backend.
+	 */
+	if (fpinfo == NULL)
+	{
+		rows = foreignrel->rows > 0 ? foreignrel->rows : 1000;
+		startup_cost = foreignrel->reltarget->cost.startup;
+		total_cost = startup_cost + foreignrel->reltarget->cost.per_tuple * rows;
+
+		*p_rows = rows;
+		*p_width = width;
+		*p_startup_cost = startup_cost;
+		*p_total_cost = total_cost;
+		return;
+	}
+
+	/*
 	 * If the table or the server is configured to use remote estimates,
 	 * connect to the foreign server and execute EXPLAIN to estimate the
 	 * number of rows selected by the restriction+join clauses.  Otherwise,
@@ -5000,6 +5018,9 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	Assert(extra->patype == PARTITIONWISE_AGGREGATE_NONE ||
 		   extra->patype == PARTITIONWISE_AGGREGATE_FULL);
 
+	if (ifpinfo == NULL || !ifpinfo->pushdown_safe)
+		return;
+
 	/* save the input_rel as outerrel in fpinfo */
 	fpinfo->outerrel = input_rel;
 
@@ -5096,6 +5117,9 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 	/* We don't support cases where there are any SRFs in the targetlist */
 	if (parse->hasTargetSRFs)
+		return;
+	
+	if (ifpinfo == NULL || !ifpinfo->pushdown_safe)
 		return;
 
 	/* Save the input_rel as outerrel in fpinfo */
@@ -5252,6 +5276,9 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 	/* We don't support cases where there are any SRFs in the targetlist */
 	if (parse->hasTargetSRFs)
+		return;
+
+	if (ifpinfo == NULL || !ifpinfo->pushdown_safe)
 		return;
 
 	/* Save the input_rel as outerrel in fpinfo */
