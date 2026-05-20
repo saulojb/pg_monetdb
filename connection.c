@@ -105,14 +105,6 @@ GetConnection(UserMapping *user, ForeignServer *server)
 	ConnCacheEntry *entry = NULL;
 	ConnCacheKey key;
 
-	char 		*host = NULL;
-	char 		*port = NULL;
-	char 		*user_str = NULL;
-	char 		*password = NULL;
-	char 		*dbname = NULL;
-	List	   	*options = NIL;
-	ListCell  	*cell = NULL;
-
 
 	/* First time through, initialize connection cache hashtable */
 	if (ConnectionHash == NULL)
@@ -175,6 +167,13 @@ GetConnection(UserMapping *user, ForeignServer *server)
 	 */
 	if (entry->conn == NULL)
 	{
+		char 		*host = NULL;
+		char 		*port = NULL;
+		char 		*user_str = NULL;
+		char 		*password = NULL;
+		char 		*dbname = NULL;
+		List	   	*options = NIL;
+		ListCell  	*cell = NULL;
 		MapiHdl hdl = NULL;
 		entry->xact_depth = 0;
 		entry->changing_xact_state = false;

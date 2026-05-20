@@ -693,6 +693,7 @@ typedef struct MonetdbFdwScanState
 	/* batch-level state, for optimizing rewinds and avoiding useless fetch */
 	int			fetch_ct_2;		/* Min(# of fetches done, 2) */
 	bool		eof_reached;	/* true if last fetch reached EOF */
+	int			next_result_row; /* next row index to consume from MAPI result */
 
 	/* for asynchronous execution */
 	bool		async_capable;	/* engage asynchronous-capable logic? */
@@ -2327,6 +2328,7 @@ MonetDB_ReScanForeignScan(ForeignScanState *node)
 	fsstate->next_tuple = 0;
 	fsstate->fetch_ct_2 = 0;
 	fsstate->eof_reached = false;
+	fsstate->next_result_row = 0;
 
 	MemoryContextReset(fsstate->batch_cxt);
 }
@@ -2343,6 +2345,13 @@ MonetDB_EndForeignScan(ForeignScanState *node)
 	/* if fsstate is NULL, we are in EXPLAIN; nothing to do */
 	if (fsstate == NULL)
 		return;
+
+	if (fsstate->hdl != NULL)
+	{
+		if (mapi_close_handle(fsstate->hdl) != MOK)
+			die(fsstate->conn, fsstate->hdl);
+		fsstate->hdl = NULL;
+	}
 
 	/* Release remote connection */
 	ReleaseConnection(fsstate->conn);
@@ -4082,39 +4091,42 @@ fetch_more_data(ForeignScanState *node)
 	PG_TRY();
 	{
 		int			numrows;
+		int			remaining;
+		int			batch_rows;
 		int			i;
 
-		/* Convert the data into HeapTuples */
+		/* Convert only one fetch_size window into HeapTuples at a time. */
 		numrows = mapi_get_row_count(fsstate->hdl);
-		fsstate->tuples = (HeapTuple *) palloc0(numrows * sizeof(HeapTuple));
-		fsstate->num_tuples = numrows;
+		remaining = numrows - fsstate->next_result_row;
+		batch_rows = Min(fsstate->fetch_size, remaining);
+		if (batch_rows < 0)
+			batch_rows = 0;
+
+		fsstate->tuples = (HeapTuple *) palloc0(batch_rows * sizeof(HeapTuple));
+		fsstate->num_tuples = batch_rows;
 		fsstate->next_tuple = 0;
 
-		for (i = 0; i < numrows; i++)
+		for (i = 0; i < batch_rows; i++)
 		{
 			Assert(IsA(node->ss.ps.plan, ForeignScan));
 
 			fsstate->tuples[i] =
-				make_tuple_from_result_row(fsstate->hdl, i,
+				make_tuple_from_result_row(fsstate->hdl,
+									   fsstate->next_result_row,
 										   fsstate->rel,
 										   fsstate->attinmeta,
 										   fsstate->retrieved_attrs,
 										   node,
 										   fsstate->temp_cxt);
+			fsstate->next_result_row++;
 		}
 
 		/* Update fetch_ct_2 */
 		if (fsstate->fetch_ct_2 < 2)
 			fsstate->fetch_ct_2++;
 
-		/*
-		 * MAPI returns the full result set in one shot, so there is nothing
-		 * more to fetch after this call.  Setting eof_reached=true prevents
-		 * IterateForeignScan from calling us again with an exhausted cursor,
-		 * which would otherwise spin in an infinite loop.
-		 * (ReScanForeignScan resets eof_reached=false before each new scan.)
-		 */
-		fsstate->eof_reached = true;
+		/* Mark EOF only after we've consumed the full MAPI result. */
+		fsstate->eof_reached = (fsstate->next_result_row >= numrows);
 	}
 	PG_FINALLY();
 	{
