@@ -72,6 +72,7 @@ void		_PG_fini(void);
 PG_MODULE_MAGIC;
 
 static planner_hook_type next_planner_hook = NULL;
+static create_upper_paths_hook_type next_create_upper_paths_hook = NULL;
 static bool pg_monetdb_enable_planner_hook_debug = false;
 
 typedef struct PgMonetdbPlannerTraceContext
@@ -83,12 +84,18 @@ static PlannedStmt *pg_monetdb_planner(Query *parse,
 									  const char *query_string,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
+static void pg_monetdb_create_upper_paths(PlannerInfo *root,
+									 UpperRelationKind stage,
+									 RelOptInfo *input_rel,
+									 RelOptInfo *output_rel,
+									 void *extra);
 static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 										 const char *query_string);
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
 static void pg_monetdb_log_query_shape(Query *query, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
+static const char *pg_monetdb_upper_stage_name(UpperRelationKind stage);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
@@ -187,6 +194,8 @@ _PG_init(void)
 
 	next_planner_hook = planner_hook;
 	planner_hook = pg_monetdb_planner;
+	next_create_upper_paths_hook = create_upper_paths_hook;
+	create_upper_paths_hook = pg_monetdb_create_upper_paths;
 }
 
 void
@@ -194,6 +203,8 @@ _PG_fini(void)
 {
 	if (planner_hook == pg_monetdb_planner)
 		planner_hook = next_planner_hook;
+	if (create_upper_paths_hook == pg_monetdb_create_upper_paths)
+		create_upper_paths_hook = next_create_upper_paths_hook;
 }
 
 static PlannedStmt *
@@ -234,6 +245,32 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 		return next_planner_hook(parse, query_string, cursorOptions, boundParams);
 
 	return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
+static void
+pg_monetdb_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+						  RelOptInfo *input_rel, RelOptInfo *output_rel,
+						  void *extra)
+{
+	if (pg_monetdb_enable_planner_hook_debug &&
+		stage == UPPERREL_GROUP_AGG &&
+		root != NULL && root->parse != NULL &&
+		(root->parse->hasAggs || root->parse->groupClause != NIL))
+	{
+		elog(DEBUG1,
+			 "pg_monetdb upper paths hook: stage=%s query_hasSubLinks=%s query_hasAggs=%s input_relkind=%d output_relkind=%d input_relids=%s output_relids=%s",
+			 pg_monetdb_upper_stage_name(stage),
+			 root->parse->hasSubLinks ? "true" : "false",
+			 root->parse->hasAggs ? "true" : "false",
+			 input_rel != NULL ? input_rel->reloptkind : -1,
+			 output_rel != NULL ? output_rel->reloptkind : -1,
+			 input_rel != NULL && input_rel->relids != NULL ? bmsToString(input_rel->relids) : "<null>",
+			 output_rel != NULL && output_rel->relids != NULL ? bmsToString(output_rel->relids) : "<null>");
+		pg_monetdb_log_query_shape(root->parse, "upper-path-query");
+	}
+
+	if (next_create_upper_paths_hook)
+		next_create_upper_paths_hook(root, stage, input_rel, output_rel, extra);
 }
 
 static bool
@@ -371,6 +408,32 @@ pg_monetdb_sublink_name(SubLinkType sublink_type)
 	}
 
 	return "UNKNOWN_SUBLINK";
+}
+
+static const char *
+pg_monetdb_upper_stage_name(UpperRelationKind stage)
+{
+	switch (stage)
+	{
+		case UPPERREL_SETOP:
+			return "UPPERREL_SETOP";
+		case UPPERREL_PARTIAL_GROUP_AGG:
+			return "UPPERREL_PARTIAL_GROUP_AGG";
+		case UPPERREL_GROUP_AGG:
+			return "UPPERREL_GROUP_AGG";
+		case UPPERREL_WINDOW:
+			return "UPPERREL_WINDOW";
+		case UPPERREL_PARTIAL_DISTINCT:
+			return "UPPERREL_PARTIAL_DISTINCT";
+		case UPPERREL_DISTINCT:
+			return "UPPERREL_DISTINCT";
+		case UPPERREL_ORDERED:
+			return "UPPERREL_ORDERED";
+		case UPPERREL_FINAL:
+			return "UPPERREL_FINAL";
+	}
+
+	return "UPPERREL_UNKNOWN";
 }
 
 /*
