@@ -136,6 +136,9 @@ static void deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 static void deparseColumnRef(StringInfo buf, int varno, int varattno,
 							 RangeTblEntry *rte, bool qualify_col);
 static void deparseRelation(StringInfo buf, Relation rel);
+static bool deparse_subquery_column_ref(StringInfo buf, int varno,
+							   int varattno, RangeTblEntry *rte,
+							   bool qualify_col);
 static void deparseExpr(Expr *node, deparse_expr_cxt *context);
 static void deparseVar(Var *node, deparse_expr_cxt *context);
 static void deparseConst(Const *node, deparse_expr_cxt *context, int showtype);
@@ -177,13 +180,19 @@ static void deparseFromExpr(List *quals, deparse_expr_cxt *context);
 static void deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context);
 static void deparseExistsSubquery(StringInfo buf, PlannerInfo *root,
 								  RelOptInfo *rel, List *extra_conds,
+								  bool negated,
 								  deparse_expr_cxt *context);
+static Expr *get_supported_any_sublink_outer_expr(SubPlan *subplan);
 static void deparseRangeTblRef(StringInfo buf, PlannerInfo *root,
 							   RelOptInfo *foreignrel, bool make_subquery,
 							   Index ignore_rel, List **ignore_conds, List **params_list);
 static void deparseAggref(Aggref *node, deparse_expr_cxt *context);
 static void deparseSubPlan(SubPlan *node, deparse_expr_cxt *context);
+static void appendSubPlanSqlTemplate(SubPlan *subplan, ForeignScan *fscan,
+								 deparse_expr_cxt *context);
 static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
+static void appendGroupByClauseForQuery(List *tlist, Query *query,
+							deparse_expr_cxt *context);
 static void appendOrderBySuffix(Oid sortop, Oid sortcoltype, bool nulls_first,
 								deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
@@ -197,8 +206,58 @@ static Node *deparseSortGroupClause(Index ref, List *tlist, bool force_colno,
  */
 static bool is_subquery_var(Var *node, RelOptInfo *foreignrel,
 							int *relno, int *colno);
+static bool is_grouped_subquery_bridge(RelOptInfo *rel);
+static bool deparse_grouped_subquery_bridge_var(Var *node,
+							deparse_expr_cxt *context);
 static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 										  int *relno, int *colno);
+
+static Expr *
+get_supported_any_sublink_outer_expr(SubPlan *subplan)
+{
+	Node	   *testexpr;
+	OpExpr	   *opexpr;
+	Node	   *leftarg;
+	Node	   *rightarg;
+	Param	   *param;
+	char	   *oprname;
+
+	if (subplan->subLinkType != ANY_SUBLINK || subplan->testexpr == NULL)
+		return NULL;
+
+	testexpr = strip_implicit_coercions(subplan->testexpr);
+	if (!IsA(testexpr, OpExpr))
+		return NULL;
+
+	opexpr = (OpExpr *) testexpr;
+	if (list_length(opexpr->args) != 2)
+		return NULL;
+
+	leftarg = strip_implicit_coercions(linitial(opexpr->args));
+	rightarg = strip_implicit_coercions(lsecond(opexpr->args));
+
+	if (IsA(leftarg, Param) && ((Param *) leftarg)->paramkind == PARAM_EXEC)
+	{
+		Node	   *tmp = leftarg;
+
+		leftarg = rightarg;
+		rightarg = tmp;
+	}
+
+	if (!IsA(rightarg, Param))
+		return NULL;
+
+	param = (Param *) rightarg;
+	if (param->paramkind != PARAM_EXEC ||
+		!list_member_int(subplan->paramIds, param->paramid))
+		return NULL;
+
+	oprname = get_opname(opexpr->opno);
+	if (oprname == NULL || strcmp(oprname, "=") != 0)
+		return NULL;
+
+	return (Expr *) leftarg;
+}
 
 
 /*
@@ -1024,12 +1083,21 @@ foreign_expr_walker(Node *node,
 				Plan	   *subplan_plan;
 				ForeignScan *fscan;
 				ListCell   *lc;
+				Expr	   *any_outer_expr = NULL;
 
 				/*
-				 * Only EXPR_SUBLINK (scalar correlated subquery) is supported.
-				 * IN/EXISTS/etc. sublinks would need different deparsing.
+				 * Support scalar subqueries and the simple ANY_SUBLINK equality
+				 * pattern used by Q16's NOT IN predicate.
 				 */
-				if (subplan->subLinkType != EXPR_SUBLINK)
+				if (subplan->subLinkType == EXPR_SUBLINK)
+					;
+				else if (subplan->subLinkType == ANY_SUBLINK)
+				{
+					any_outer_expr = get_supported_any_sublink_outer_expr(subplan);
+					if (any_outer_expr == NULL)
+						return false;
+				}
+				else
 					return false;
 
 				/*
@@ -1054,6 +1122,11 @@ foreign_expr_walker(Node *node,
 				 */
 				if (list_length(fscan->fdw_private) == 0 ||
 					!IsA(linitial(fscan->fdw_private), String))
+					return false;
+
+				if (any_outer_expr != NULL &&
+					!foreign_expr_walker((Node *) any_outer_expr,
+									 glob_cxt, outer_cxt, case_arg_cxt))
 					return false;
 
 				/*
@@ -1318,6 +1391,25 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	deparse_expr_cxt context;
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
 	List	   *quals;
+	bool		grouped_bridge = is_grouped_subquery_bridge(rel);
+	RangeTblEntry *bridge_rte = NULL;
+	Query	   *bridge_query = NULL;
+	List	   *bridge_having = NIL;
+	List	   *bridge_where = NIL;
+	List	   *groupby_tlist = tlist;
+
+	if (grouped_bridge)
+	{
+		bridge_rte = planner_rt_fetch(rel->relid, root);
+		Assert(bridge_rte->rtekind == RTE_SUBQUERY);
+		Assert(bridge_rte->subquery != NULL);
+		bridge_query = bridge_rte->subquery;
+		groupby_tlist = bridge_query->targetList;
+		if (bridge_query->jointree != NULL && bridge_query->jointree->quals != NULL)
+			bridge_where = make_ands_implicit((Expr *) bridge_query->jointree->quals);
+		if (bridge_query->havingQual != NULL)
+			bridge_having = make_ands_implicit((Expr *) bridge_query->havingQual);
+	}
 
 	/*
 	 * We handle relations for foreign tables, joins between those and upper
@@ -1329,7 +1421,8 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.buf = buf;
 	context.root = root;
 	context.foreignrel = rel;
-	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
+	context.scanrel = grouped_bridge ? rel :
+		(IS_UPPER_REL(rel) ? fpinfo->outerrel : rel);
 	context.params_list = params_list;
 
 	/* Construct SELECT clause */
@@ -1340,12 +1433,17 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	 * conditions of the underlying scan relation; otherwise, we can use the
 	 * supplied list of remote conditions directly.
 	 */
-	if (IS_UPPER_REL(rel))
+	if (IS_UPPER_REL(rel) || grouped_bridge)
 	{
-		MonetdbFdwRelationInfo *ofpinfo;
+		if (grouped_bridge)
+			quals = bridge_where;
+		else
+		{
+			MonetdbFdwRelationInfo *ofpinfo;
 
-		ofpinfo = (MonetdbFdwRelationInfo *) fpinfo->outerrel->fdw_private;
-		quals = ofpinfo->remote_conds;
+			ofpinfo = (MonetdbFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+			quals = ofpinfo->remote_conds;
+		}
 	}
 	else
 		quals = remote_conds;
@@ -1353,16 +1451,20 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	/* Construct FROM and WHERE clauses */
 	deparseFromExpr(quals, &context); 
 
-	if (IS_UPPER_REL(rel))
+	if (IS_UPPER_REL(rel) || grouped_bridge)
 	{
 		/* Append GROUP BY clause */
-		appendGroupByClause(tlist, &context);
+		if (grouped_bridge)
+			appendGroupByClauseForQuery(groupby_tlist, bridge_query, &context);
+		else
+			appendGroupByClause(tlist, &context);
 
 		/* Append HAVING clause */
-		if (remote_conds)
+		if (grouped_bridge ? bridge_having != NIL : remote_conds != NIL)
 		{
 			appendStringInfoString(buf, " HAVING ");
-			appendConditions(remote_conds, &context);
+			appendConditions(grouped_bridge ? bridge_having : remote_conds,
+					 &context);
 		}
 	}
 
@@ -1376,6 +1478,18 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 
 	/* Add any necessary FOR UPDATE/SHARE. */
 	deparseLockingClause(&context);
+}
+
+static bool
+is_grouped_subquery_bridge(RelOptInfo *rel)
+{
+	MonetdbFdwRelationInfo *fpinfo;
+
+	if (rel == NULL || rel->fdw_private == NULL)
+		return false;
+
+	fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
+	return (!IS_UPPER_REL(rel) && fpinfo->stage == UPPERREL_GROUP_AGG);
 }
 
 /*
@@ -1405,7 +1519,7 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 	 */
 	appendStringInfoString(buf, "SELECT ");
 
-	if (is_subquery)
+	if (is_subquery || is_grouped_subquery_bridge(foreignrel))
 	{
 		/*
 		 * For a relation that is deparsed as a subquery, emit expressions
@@ -1463,17 +1577,23 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 	appendStringInfoString(buf, " FROM ");
 
 	if (IS_JOIN_REL(scanrel) &&
-		((MonetdbFdwRelationInfo *) scanrel->fdw_private)->jointype == JOIN_SEMI)
+		((((MonetdbFdwRelationInfo *) scanrel->fdw_private)->jointype == JOIN_SEMI) ||
+		 (((MonetdbFdwRelationInfo *) scanrel->fdw_private)->jointype == JOIN_ANTI)))
 	{
 		/*
-		 * Semi-join: emit outer relation in FROM, then build WHERE with
-		 * EXISTS for the inner relation.
+		 * Semi/anti-join: emit outer relation in FROM, then build WHERE with
+		 * EXISTS/NOT EXISTS for the inner relation.
 		 */
 		deparseFromExprForSemiJoin(quals, context);
 	}
 	else
 	{
-		deparseFromExprForRel(buf, context->root, scanrel,
+		if (scanrel != context->foreignrel &&
+			is_grouped_subquery_bridge(scanrel))
+			deparseRangeTblRef(buf, context->root, scanrel, true,
+						   (Index) 0, NULL, context->params_list);
+		else
+			deparseFromExprForRel(buf, context->root, scanrel,
 							  (bms_membership(scanrel->relids) == BMS_MULTIPLE),
 							  (Index) 0, NULL, context->params_list);
 
@@ -1489,9 +1609,9 @@ deparseFromExpr(List *quals, deparse_expr_cxt *context)
 /*
  * deparseFromExprForSemiJoin
  *
- * Generate FROM + WHERE for a top-level semi-join relation.
- * The outer relation appears in FROM; the inner relation is expressed as
- * EXISTS (SELECT 1 FROM inner WHERE joinclauses [AND inner_conds]).
+	 * Generate FROM + WHERE for a top-level semi/anti-join relation.
+	 * The outer relation appears in FROM; the inner relation is expressed as
+	 * EXISTS/NOT EXISTS (SELECT 1 FROM inner WHERE joinclauses [AND inner_conds]).
  * Any additional quals (pushed-down upper-rel conditions) are added to WHERE.
  */
 static void
@@ -1505,6 +1625,7 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 	RelOptInfo *innerrel = fpinfo->innerrel;
 	MonetdbFdwRelationInfo *fpinfo_o =
 		(MonetdbFdwRelationInfo *) outerrel->fdw_private;
+	bool		negated = (fpinfo->jointype == JOIN_ANTI);
 	bool		is_first = true;
 
 	/* Emit the outer relation's FROM entry */
@@ -1512,7 +1633,7 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 					   fpinfo->make_outerrel_subquery,
 					   0, NULL, context->params_list);
 
-	/* Build WHERE: outer_conds AND EXISTS(inner, joinclauses) AND quals */
+	/* Build WHERE: outer_conds AND EXISTS/NOT EXISTS(inner, joinclauses) AND quals */
 	if (fpinfo_o->remote_conds || fpinfo->joinclauses || quals)
 	{
 		appendStringInfoString(buf, " WHERE ");
@@ -1528,7 +1649,9 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 			if (!is_first)
 				appendStringInfoString(buf, " AND ");
 			deparseExistsSubquery(buf, context->root, innerrel,
-								  fpinfo->joinclauses, context);
+								  fpinfo->joinclauses,
+								  negated,
+								  context);
 			is_first = false;
 		}
 
@@ -1544,7 +1667,7 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
 /*
  * deparseExistsSubquery
  *
- * Emit: EXISTS (SELECT 1 FROM rel WHERE rel_conds AND extra_conds)
+	 * Emit: EXISTS/NOT EXISTS (SELECT 1 FROM rel WHERE rel_conds AND extra_conds)
  *
  * For nested semi-join relations the function recurses, producing nested
  * EXISTS subqueries.  For base relations fpinfo->remote_conds are the
@@ -1554,23 +1677,27 @@ deparseFromExprForSemiJoin(List *quals, deparse_expr_cxt *context)
  */
 static void
 deparseExistsSubquery(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
-					  List *extra_conds, deparse_expr_cxt *context)
+					  List *extra_conds, bool negated,
+					  deparse_expr_cxt *context)
 {
 	MonetdbFdwRelationInfo *fpinfo =
 		(MonetdbFdwRelationInfo *) rel->fdw_private;
 
-	appendStringInfoString(buf, "EXISTS (SELECT 1 FROM ");
+	appendStringInfoString(buf, negated ? "NOT EXISTS (SELECT 1 FROM " :
+									  "EXISTS (SELECT 1 FROM ");
 
-	if (IS_JOIN_REL(rel) && fpinfo->jointype == JOIN_SEMI)
+	if (IS_JOIN_REL(rel) &&
+		(fpinfo->jointype == JOIN_SEMI || fpinfo->jointype == JOIN_ANTI))
 	{
 		/*
-		 * Nested semi-join: expand as outer_from WHERE outer_conds AND
-		 * EXISTS(innerrel, inner_joinclauses) AND extra_conds.
+		 * Nested semi/anti-join: expand as outer_from WHERE outer_conds AND
+		 * EXISTS/NOT EXISTS(innerrel, inner_joinclauses) AND extra_conds.
 		 */
 		RelOptInfo *outerrel = fpinfo->outerrel;
 		RelOptInfo *innerrel = fpinfo->innerrel;
 		MonetdbFdwRelationInfo *fpinfo_o =
 			(MonetdbFdwRelationInfo *) outerrel->fdw_private;
+		bool		inner_negated = (fpinfo->jointype == JOIN_ANTI);
 		bool		is_first = true;
 
 		deparseRangeTblRef(buf, root, outerrel,
@@ -1592,7 +1719,9 @@ deparseExistsSubquery(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 				if (!is_first)
 					appendStringInfoString(buf, " AND ");
 				deparseExistsSubquery(buf, root, innerrel,
-									  fpinfo->joinclauses, context);
+									  fpinfo->joinclauses,
+									  inner_negated,
+									  context);
 				is_first = false;
 			}
 
@@ -1847,6 +1976,9 @@ get_jointype_name(JoinType jointype)
 		case JOIN_SEMI:
 			return "SEMI";
 
+		case JOIN_ANTI:
+			return "ANTI";
+
 		default:
 			/* Shouldn't come here, but protect from buggy code. */
 			elog(ERROR, "unsupported join type %d", jointype);
@@ -1908,16 +2040,38 @@ deparseSubqueryTargetList(deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	RelOptInfo *foreignrel = context->foreignrel;
+	RangeTblEntry *rte = NULL;
+	List	   *target_exprs = NIL;
 	bool		first;
 	ListCell   *lc;
 
 	/* Should only be called in these cases. */
 	Assert(IS_SIMPLE_REL(foreignrel) || IS_JOIN_REL(foreignrel));
 
-	first = true;
-	foreach(lc, foreignrel->reltarget->exprs)
+	if (is_grouped_subquery_bridge(foreignrel))
 	{
-		Node	   *node = (Node *) lfirst(lc);
+		rte = planner_rt_fetch(foreignrel->relid, context->root);
+		Assert(rte->rtekind == RTE_SUBQUERY);
+		Assert(rte->subquery != NULL);
+		target_exprs = rte->subquery->targetList;
+	}
+
+	first = true;
+	foreach(lc, target_exprs != NIL ? target_exprs : foreignrel->reltarget->exprs)
+	{
+		Node	   *node;
+
+		if (target_exprs != NIL)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (tle->resjunk)
+				continue;
+			node = flatten_group_exprs(context->root, rte->subquery,
+								  (Node *) tle->expr);
+		}
+		else
+			node = (Node *) lfirst(lc);
 
 		if (!first)
 			appendStringInfoString(buf, ", ");
@@ -2072,12 +2226,20 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	{
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
 		Relation	rel;
+		RangeTblEntry *base_rte = rte;
+
+		if (is_grouped_subquery_bridge(foreignrel))
+		{
+			Assert(rte->rtekind == RTE_SUBQUERY);
+			Assert(rte->subquery != NULL);
+			base_rte = rt_fetch(1, rte->subquery->rtable);
+		}
 
 		/*
 		 * Core code already has some lock on each rel being planned, so we
 		 * can use NoLock here.
 		 */
-		rel = table_open(rte->relid, NoLock);
+		rel = table_open(base_rte->relid, NoLock);
 
 		deparseRelation(buf, rel);
 
@@ -2158,12 +2320,13 @@ deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	else
 	{
 		/*
-		 * Semi-join rels cannot be emitted as "X SEMI JOIN Y ON ..." because
-		 * that is not valid SQL.  Force the subquery path so that
+		 * Semi/anti-join rels cannot be emitted as "X SEMI/ANTI JOIN Y ON ..."
+		 * because that is not valid SQL.  Force the subquery path so that
 		 * deparseSelectStmtForRel → deparseFromExpr → deparseFromExprForSemiJoin
 		 * generates the correct EXISTS-based SQL.
 		 */
-		if (IS_JOIN_REL(foreignrel) && fpinfo->jointype == JOIN_SEMI)
+		if (IS_JOIN_REL(foreignrel) &&
+			(fpinfo->jointype == JOIN_SEMI || fpinfo->jointype == JOIN_ANTI))
 		{
 			List	   *retrieved_attrs;
 
@@ -2753,6 +2916,10 @@ static void
 deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 				 bool qualify_col)
 {
+	if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL && varattno > 0 &&
+		deparse_subquery_column_ref(buf, varno, varattno, rte, qualify_col))
+		return;
+
 	if (varattno < 0)
 	{
 		/*
@@ -2863,6 +3030,41 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 
 		appendStringInfoString(buf, quote_identifier(colname));
 	}
+}
+
+static bool
+deparse_subquery_column_ref(StringInfo buf, int varno, int varattno,
+						  RangeTblEntry *rte, bool qualify_col)
+{
+	TargetEntry *tle;
+	Var		   *inner_var;
+	RangeTblEntry *inner_rte;
+	char	   *colname;
+
+	tle = get_tle_by_resno(rte->subquery->targetList, varattno);
+	if (tle == NULL || tle->resjunk)
+		return false;
+
+	if (qualify_col)
+		ADD_REL_QUALIFIER(buf, varno);
+
+	if (tle->resname != NULL)
+	{
+		appendStringInfoString(buf, quote_identifier(tle->resname));
+		return true;
+	}
+
+	if (!IsA(tle->expr, Var))
+		return false;
+
+	inner_var = (Var *) tle->expr;
+	inner_rte = rt_fetch(inner_var->varno, rte->subquery->rtable);
+	if (inner_rte->rtekind != RTE_RELATION)
+		return false;
+
+	colname = get_attname(inner_rte->relid, inner_var->varattno, false);
+	appendStringInfoString(buf, quote_identifier(colname));
+	return true;
 }
 
 /*
@@ -3017,11 +3219,31 @@ static void
 deparseVar(Var *node, deparse_expr_cxt *context)
 {
 	Relids		relids = context->scanrel->relids;
+	MonetdbFdwRelationInfo *scan_fpinfo;
 	int			relno;
 	int			colno;
 
 	/* Qualify columns when multiple relations are involved. */
 	bool		qualify_col = (bms_membership(relids) == BMS_MULTIPLE);
+	scan_fpinfo = (MonetdbFdwRelationInfo *) context->scanrel->fdw_private;
+
+	if (is_grouped_subquery_bridge(context->scanrel) &&
+		context->foreignrel != context->scanrel &&
+		node->varlevelsup == 0 &&
+		bms_is_member(node->varno, relids) &&
+		node->varattno > 0)
+	{
+		appendStringInfo(context->buf, "%s%d.%s%d",
+						 SUBQUERY_REL_ALIAS_PREFIX,
+						 scan_fpinfo->relation_index,
+						 SUBQUERY_COL_ALIAS_PREFIX,
+						 node->varattno);
+		return;
+	}
+
+	if (is_grouped_subquery_bridge(context->scanrel) &&
+		deparse_grouped_subquery_bridge_var(node, context))
+		return;
 
 	/*
 	 * If the Var belongs to the foreign relation that is deparsed as a
@@ -3069,6 +3291,72 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 			printRemotePlaceholder(node->vartype, node->vartypmod, context);
 		}
 	}
+}
+
+static bool
+deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
+{
+	RangeTblEntry *bridge_rte;
+	Query	   *subquery;
+	TargetEntry *tle;
+	Var		   *inner_var;
+	RangeTblEntry *inner_rte;
+
+	if (node->varlevelsup != 0)
+		return false;
+
+	bridge_rte = planner_rt_fetch(context->scanrel->relid, context->root);
+	if (bridge_rte->rtekind != RTE_SUBQUERY || bridge_rte->subquery == NULL)
+		return false;
+
+	subquery = bridge_rte->subquery;
+
+	if (node->varno == context->scanrel->relid)
+	{
+		tle = get_tle_by_resno(subquery->targetList, node->varattno);
+		if (tle == NULL || tle->resjunk)
+			return false;
+
+		if (tle->resname != NULL)
+		{
+			appendStringInfoString(context->buf,
+				quote_identifier(tle->resname));
+			return true;
+		}
+
+		if (!IsA(tle->expr, Var))
+			return false;
+
+		inner_var = (Var *) tle->expr;
+		inner_rte = rt_fetch(inner_var->varno, subquery->rtable);
+		if (inner_rte->rtekind == RTE_GROUP)
+			return false;
+		deparseColumnRef(context->buf, inner_var->varno, inner_var->varattno,
+					 inner_rte, false);
+		return true;
+	}
+
+	if (node->varno < 1 || node->varno > list_length(subquery->rtable))
+		return false;
+
+	inner_rte = rt_fetch(node->varno, subquery->rtable);
+	if (inner_rte->rtekind == RTE_GROUP)
+	{
+		tle = get_tle_by_resno(subquery->targetList, node->varattno);
+		if (tle != NULL && !tle->resjunk && tle->resname != NULL)
+		{
+			appendStringInfoString(context->buf,
+				quote_identifier(tle->resname));
+			return true;
+		}
+		return false;
+	}
+	if (inner_rte->rtekind != RTE_RELATION)
+		return false;
+
+	deparseColumnRef(context->buf, node->varno, node->varattno, inner_rte,
+				 false);
+	return true;
 }
 
 /*
@@ -3682,7 +3970,6 @@ deparseScalarArrayOpExprAsIn(ScalarArrayOpExpr *node,
 							  elem_values[i],
 							  false,
 							  elembyval);
-
 			if (!first)
 				appendStringInfoString(buf, ", ");
 			deparseConst(elemconst, context, 0);
@@ -3951,99 +4238,55 @@ deparseAggref(Aggref *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, ')');
 }
 
-/*
- * Deparse a scalar SubPlan (EXPR_SUBLINK) as an inline correlated subquery.
- *
- * We take the SQL template from the inner ForeignScan's fdw_private and
- * substitute $N::typename placeholders with the corresponding outer
- * expressions from SubPlan.args, deparsed in the outer query context.
- *
- * This enables the entire correlated subquery to be pushed to MonetDB as
- * a single SQL statement instead of being evaluated row-by-row.
- */
 static void
-deparseSubPlan(SubPlan *subplan, deparse_expr_cxt *context)
+appendSubPlanSqlTemplate(SubPlan *subplan, ForeignScan *fscan,
+							 deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	Plan	   *subplan_plan;
-	ForeignScan *fscan;
 	char	   *inner_sql;
 	const char *p;
 	int			n_fdw_exprs;
 
-	Assert(subplan->subLinkType == EXPR_SUBLINK);
-
-	/* Get the inner ForeignScan from the global subplans list */
-	subplan_plan = (Plan *) list_nth(context->root->glob->subplans,
-									 subplan->plan_id - 1);
-	Assert(IsA(subplan_plan, ForeignScan));
-	fscan = (ForeignScan *) subplan_plan;
-
-	/* The SQL template (with $N::type placeholders) is in fdw_private[0] */
 	inner_sql = strVal(linitial(fscan->fdw_private));
 	n_fdw_exprs = list_length(fscan->fdw_exprs);
-
-	/* Emit as a parenthesised scalar subquery */
-	appendStringInfoChar(buf, '(');
-
-	/*
-	 * Scan inner_sql character by character.  When we encounter $N (an
-	 * integer parameter placeholder), look up the corresponding outer
-	 * expression from SubPlan.args via the paramIds mapping and deparse it
-	 * in the outer context instead.  Skip the ::typename cast that follows.
-	 */
 	p = inner_sql;
+
 	while (*p)
 	{
 		if (*p == '$' && isdigit((unsigned char) *(p + 1)))
 		{
 			int			paramno = 0;
 
-			p++;					/* skip '$' */
+			p++;
 			while (isdigit((unsigned char) *p))
 				paramno = paramno * 10 + (*p++ - '0');
 
-			/* Skip optional ::typename cast */
 			if (p[0] == ':' && p[1] == ':')
 			{
 				p += 2;
-				/* Read base type name: letters, digits, underscore, dot */
 				while (*p && (isalnum((unsigned char) *p) ||
 							  *p == '_' || *p == '.'))
 					p++;
-				/*
-				 * Handle compound type names with a single space separator
-				 * (e.g. "double precision", "character varying").
-				 */
 				if (*p == ' ' &&
 					(pg_strncasecmp(p + 1, "precision", 9) == 0 ||
 					 pg_strncasecmp(p + 1, "varying", 7) == 0))
 				{
-					p++;		/* skip space */
+					p++;
 					while (*p && (isalnum((unsigned char) *p) || *p == '_'))
 						p++;
 				}
-				/* Handle typmod: (n) or (m,n) */
 				if (*p == '(')
 				{
 					p++;
 					while (*p && *p != ')')
 						p++;
 					if (*p)
-						p++;	/* skip closing ')' */
+						p++;
 				}
 			}
 
-			/* Substitute with the corresponding outer expression */
 			if (paramno >= 1 && paramno <= n_fdw_exprs)
 			{
-				/*
-				 * $N in the inner SQL corresponds to fdw_exprs[N-1], which
-				 * is a PARAM_EXEC node.  Find the matching entry in
-				 * SubPlan.paramIds and use the corresponding SubPlan.args
-				 * expression (which is the outer Var/expression) deparsed
-				 * in the outer context.
-				 */
 				Param	   *param = (Param *) list_nth(fscan->fdw_exprs,
 													   paramno - 1);
 				ListCell   *lc_id;
@@ -4069,8 +4312,43 @@ deparseSubPlan(SubPlan *subplan, deparse_expr_cxt *context)
 		else
 			appendStringInfoChar(buf, *p++);
 	}
+}
 
-	appendStringInfoChar(buf, ')');
+/*
+ * Deparse a pushed-down SubPlan.
+ */
+static void
+deparseSubPlan(SubPlan *subplan, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	Plan	   *subplan_plan;
+	ForeignScan *fscan;
+	Expr	   *any_outer_expr;
+
+	Assert(subplan->subLinkType == EXPR_SUBLINK ||
+		   subplan->subLinkType == ANY_SUBLINK);
+
+	subplan_plan = (Plan *) list_nth(context->root->glob->subplans,
+									 subplan->plan_id - 1);
+	Assert(IsA(subplan_plan, ForeignScan));
+	fscan = (ForeignScan *) subplan_plan;
+
+	if (subplan->subLinkType == EXPR_SUBLINK)
+	{
+		appendStringInfoChar(buf, '(');
+		appendSubPlanSqlTemplate(subplan, fscan, context);
+		appendStringInfoChar(buf, ')');
+		return;
+	}
+
+	any_outer_expr = get_supported_any_sublink_outer_expr(subplan);
+	Assert(any_outer_expr != NULL);
+
+	appendStringInfoChar(buf, '(');
+	deparseExpr(any_outer_expr, context);
+	appendStringInfoString(buf, " IN (");
+	appendSubPlanSqlTemplate(subplan, fscan, context);
+	appendStringInfoString(buf, "))");
 }
 
 /*
@@ -4192,30 +4470,24 @@ printRemotePlaceholder(Oid paramtype, int32 paramtypmod,
 static void
 appendGroupByClause(List *tlist, deparse_expr_cxt *context)
 {
+	appendGroupByClauseForQuery(tlist, context->root->parse, context);
+}
+
+static void
+appendGroupByClauseForQuery(List *tlist, Query *query,
+						deparse_expr_cxt *context)
+{
 	StringInfo	buf = context->buf;
-	Query	   *query = context->root->parse;
 	ListCell   *lc;
 	bool		first = true;
 
-	/* Nothing to be done, if there's no GROUP BY clause in the query. */
-	if (!query->groupClause)
+	if (query == NULL || !query->groupClause)
 		return;
 
 	appendStringInfoString(buf, " GROUP BY ");
 
-	/*
-	 * Queries with grouping sets are not pushed down, so we don't expect
-	 * grouping sets here.
-	 */
 	Assert(!query->groupingSets);
 
-	/*
-	 * We intentionally print query->groupClause not processed_groupClause,
-	 * leaving it to the remote planner to get rid of any redundant GROUP BY
-	 * items again.  This is necessary in case processed_groupClause reduced
-	 * to empty, and in any case the redundancy situation on the remote might
-	 * be different than what we think here.
-	 */
 	foreach(lc, query->groupClause)
 	{
 		SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
@@ -4546,6 +4818,12 @@ get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 
 	/* Get the relation alias ID */
 	*relno = fpinfo->relation_index;
+
+	if (is_grouped_subquery_bridge(foreignrel))
+	{
+		*colno = node->varattno;
+		return;
+	}
 
 	/* Get the column alias ID */
 	i = 1;

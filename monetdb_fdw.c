@@ -104,12 +104,24 @@ static void pg_monetdb_set_join_pathlist(PlannerInfo *root,
 									 JoinPathExtraData *extra);
 static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 										 const char *query_string);
+static PlannedStmt *pg_monetdb_plan_with_next(Query *parse,
+								 const char *query_string,
+								 int cursorOptions,
+								 ParamListInfo boundParams);
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
 static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
 										 Oid *relid_out);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   Index rti,
+									   RangeTblEntry *rte,
 									   Oid relid);
+static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
+static void MonetDB_GetForeignJoinPaths(PlannerInfo *root,
+						   RelOptInfo *joinrel,
+						   RelOptInfo *outerrel,
+						   RelOptInfo *innerrel,
+						   JoinType jointype,
+						   JoinPathExtraData *extra);
 static void pg_monetdb_log_query_shape(Query *query, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
@@ -139,6 +151,8 @@ enum FdwScanPrivateIndex
 	FdwScanPrivateRetrievedAttrs,
 	/* Integer representing the desired fetch_size */
 	FdwScanPrivateFetchSize,
+	/* Oid of the foreign server used for the remote scan */
+	FdwScanPrivateServerId,
 
 	/*
 	 * String describing join i.e. names of relations being joined and types
@@ -273,10 +287,8 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 		}
 	}
 
-	if (next_planner_hook)
-		result = next_planner_hook(parse, query_string, cursorOptions, boundParams);
-	else
-		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+	result = pg_monetdb_plan_with_next(parse, query_string,
+						  cursorOptions, boundParams);
 
 	if (trace_active)
 		pg_monetdb_trace_active_depth--;
@@ -284,6 +296,15 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 	return result;
 }
 
+static PlannedStmt *
+pg_monetdb_plan_with_next(Query *parse, const char *query_string,
+					  int cursorOptions, ParamListInfo boundParams)
+{
+	if (next_planner_hook)
+		return next_planner_hook(parse, query_string, cursorOptions, boundParams);
+
+	return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
 static void
 pg_monetdb_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 						  RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -318,7 +339,7 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
 		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
-		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, derived_relid);
+		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, rte, derived_relid);
 
 	if (pg_monetdb_enable_planner_hook_debug &&
 		root != NULL && root->parse != NULL &&
@@ -357,6 +378,14 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 	if (rte == NULL || rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
 		return false;
 
+	/*
+	 * Derived grouped subqueries from the query text have no relid.  View
+	 * expansion also produces RTE_SUBQUERY, but those carry the view relid and
+	 * need different semantics from the Q18 bridge path.
+	 */
+	if (OidIsValid(rte->relid))
+		return false;
+
 	subquery = rte->subquery;
 	if (!subquery->hasAggs || subquery->groupClause == NIL ||
 		list_length(subquery->rtable) != 2 || subquery->hasSubLinks)
@@ -381,7 +410,8 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 }
 
 static void
-pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Index rti, Oid relid)
+pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Index rti,
+							  RangeTblEntry *rte, Oid relid)
 {
 	ForeignTable *table;
 	ForeignServer *server;
@@ -408,7 +438,23 @@ pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel, Index rti, Oid relid)
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;
 
+	rel->serverid = table->serverid;
+	rel->userid = GetUserId();
+	rel->useridiscurrent = true;
+	rel->fdwroutine = GetFdwRoutineByServerId(table->serverid);
 	rel->fdw_private = fpinfo;
+}
+
+static bool
+pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel)
+{
+	MonetdbFdwRelationInfo *fpinfo;
+
+	if (rel == NULL || rel->fdw_private == NULL)
+		return false;
+
+	fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
+	return (!IS_UPPER_REL(rel) && fpinfo->stage == UPPERREL_GROUP_AGG);
 }
 
 static void
@@ -416,6 +462,21 @@ pg_monetdb_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 					 RelOptInfo *outerrel, RelOptInfo *innerrel,
 					 JoinType jointype, JoinPathExtraData *extra)
 {
+	if (pg_monetdb_enable_planner_hook_debug &&
+		joinrel != NULL && joinrel->fdw_private == NULL &&
+		outerrel != NULL && innerrel != NULL &&
+		outerrel->fdw_private != NULL && innerrel->fdw_private != NULL &&
+		(pg_monetdb_is_grouped_bridge_rel(outerrel) ||
+		 pg_monetdb_is_grouped_bridge_rel(innerrel)))
+	{
+		elog(DEBUG1,
+			 "pg_monetdb join hook: probing foreign join path for grouped bridge outer_stage=%d inner_stage=%d",
+			 ((MonetdbFdwRelationInfo *) outerrel->fdw_private)->stage,
+			 ((MonetdbFdwRelationInfo *) innerrel->fdw_private)->stage);
+		MonetDB_GetForeignJoinPaths(root, joinrel, outerrel, innerrel,
+						   jointype, extra);
+	}
+
 	if (pg_monetdb_enable_planner_hook_debug &&
 		root != NULL && root->parse != NULL)
 	{
@@ -435,7 +496,7 @@ pg_monetdb_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 
 	if (next_set_join_pathlist_hook)
 		next_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
-						   jointype, extra);
+					   jointype, extra);
 }
 
 static bool
@@ -765,6 +826,7 @@ static void MonetDB_GetForeignPaths(PlannerInfo *root,
 									RelOptInfo *baserel,
 									Oid foreigntableid);
 static bool monetdb_subplan_is_inlineable(Node *expr, PlannerInfo *root);
+static bool monetdb_is_supported_any_sublink(SubPlan *subplan);
 static ForeignScan *MonetDB_GetForeignPlan(PlannerInfo *root,
 										   RelOptInfo *foreignrel,
 										   Oid foreigntableid,
@@ -1640,6 +1702,53 @@ typedef struct
 } SubPlanInlineCtx;
 
 static bool
+monetdb_is_supported_any_sublink(SubPlan *subplan)
+{
+	Node	   *testexpr;
+	OpExpr	   *opexpr;
+	Node	   *leftarg;
+	Node	   *rightarg;
+	Param	   *param;
+	char	   *oprname;
+
+	if (subplan->subLinkType != ANY_SUBLINK || subplan->testexpr == NULL)
+		return false;
+
+	testexpr = strip_implicit_coercions(subplan->testexpr);
+	if (!IsA(testexpr, OpExpr))
+		return false;
+
+	opexpr = (OpExpr *) testexpr;
+	if (list_length(opexpr->args) != 2)
+		return false;
+
+	leftarg = strip_implicit_coercions(linitial(opexpr->args));
+	rightarg = strip_implicit_coercions(lsecond(opexpr->args));
+
+	if (IsA(leftarg, Param) && ((Param *) leftarg)->paramkind == PARAM_EXEC)
+	{
+		Node	   *tmp = leftarg;
+
+		leftarg = rightarg;
+		rightarg = tmp;
+	}
+
+	if (!IsA(rightarg, Param))
+		return false;
+
+	param = (Param *) rightarg;
+	if (param->paramkind != PARAM_EXEC ||
+		!list_member_int(subplan->paramIds, param->paramid))
+		return false;
+
+	oprname = get_opname(opexpr->opno);
+	if (oprname == NULL || strcmp(oprname, "=") != 0)
+		return false;
+
+	return true;
+}
+
+static bool
 subplan_inline_walker(Node *node, SubPlanInlineCtx *ctx)
 {
 	if (node == NULL)
@@ -1649,7 +1758,8 @@ subplan_inline_walker(Node *node, SubPlanInlineCtx *ctx)
 		SubPlan    *sp = (SubPlan *) node;
 		Plan	   *inner;
 
-		if (sp->subLinkType != EXPR_SUBLINK)
+		if (sp->subLinkType != EXPR_SUBLINK &&
+			!monetdb_is_supported_any_sublink(sp))
 		{
 			ctx->ok = false;
 			return true;		/* stop walking */
@@ -1856,7 +1966,6 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 		 * locally.
 		 */
 
-		/* Build the list of columns to be fetched from the foreign server. */
 		fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
 
 		/*
@@ -1930,9 +2039,10 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 	 * Build the fdw_private list that will be available to the executor.
 	 * Items in the list must match order in enum FdwScanPrivateIndex.
 	 */
-	fdw_private = list_make3(makeString(sql.data),
+	fdw_private = list_make4(makeString(sql.data),
 							 retrieved_attrs,
-							 makeInteger(fpinfo->fetch_size));
+							 makeInteger(fpinfo->fetch_size),
+							 makeInteger(fpinfo->server->serverid));
 	if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 		fdw_private = lappend(fdw_private,
 							  makeString(fpinfo->relation_name));
@@ -2017,10 +2127,10 @@ MonetDB_BeginForeignScan(ForeignScanState *node, int eflags)
 	MonetdbFdwScanState *fsstate;
 	RangeTblEntry *rte;
 	Oid			userid;
-	ForeignTable *table;
 	UserMapping *user;
 	int			rtindex;
 	int			numParams;
+	Oid			serverid;
 	ForeignServer *server = NULL;
 
 	/*
@@ -2049,10 +2159,19 @@ MonetDB_BeginForeignScan(ForeignScanState *node, int eflags)
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 #endif
 
-	/* Get info about foreign table. */
-	table = GetForeignTable(rte->relid);
-	user = GetUserMapping(userid, table->serverid);
-	server = GetForeignServer(table->serverid);
+	serverid = intVal(list_nth(fsplan->fdw_private,
+							  FdwScanPrivateServerId));
+
+	/*
+	 * Grouped-bridge scans can retain scanrelid > 0 even though the owning
+	 * RTE is a rewritten subquery or view, not a foreign table relation.
+	 */
+	if (rte->rtekind == RTE_RELATION &&
+		get_rel_relkind(rte->relid) == RELKIND_FOREIGN_TABLE)
+		serverid = GetForeignTable(rte->relid)->serverid;
+
+	user = GetUserMapping(userid, serverid);
+	server = GetForeignServer(serverid);
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -2080,7 +2199,7 @@ MonetDB_BeginForeignScan(ForeignScanState *node, int eflags)
 	 * Get info we'll need for converting data fetched from the foreign server
 	 * into local representation and error reporting during that process.
 	 */
-	if (fsplan->scan.scanrelid > 0)
+	if (fsplan->scan.scanrelid > 0 && node->ss.ss_currentRelation != NULL)
 	{
 		fsstate->rel = node->ss.ss_currentRelation;
 		fsstate->tupdesc = RelationGetDescr(fsstate->rel);
@@ -6514,9 +6633,10 @@ getBoolVal(DefElem *def)
  * add_missing_vars_to_reltarget
  *
  * Walk the given list of RestrictInfos and add any Var nodes that belong to
- * 'rel' (i.e. their varno is in rel->relids) but are not yet present in
- * rel->reltarget->exprs.  Used when a JOIN_SEMI relation is about to be
- * wrapped as a subquery: the parent join's ON clause may reference columns
+	 * 'rel' (i.e. their varno is in rel->relids) but are not yet present in
+	 * rel->reltarget->exprs.  Used when a JOIN_SEMI/JOIN_ANTI relation is
+	 * about to be wrapped as a subquery: the parent join's ON clause may
+	 * reference columns
  * from that semi-join that the planner did not include in its reltarget
  * (because they are only consumed in the ON clause, not passed above).
  */
@@ -6583,13 +6703,13 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, and SEMI joins.
-	 * SEMI joins are deparsed as EXISTS (SELECT 1 FROM inner WHERE ...).
-	 * ANTI joins are not yet supported.
+	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, SEMI, and ANTI
+	 * joins.  SEMI joins are deparsed as EXISTS (SELECT 1 FROM inner WHERE
+	 * ...); ANTI joins are deparsed as NOT EXISTS with the same structure.
 	 */
 	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
 		jointype != JOIN_RIGHT && jointype != JOIN_FULL &&
-		jointype != JOIN_SEMI)
+		jointype != JOIN_SEMI && jointype != JOIN_ANTI)
 		return false;
 
 	/*
@@ -6602,6 +6722,15 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 
 	if (!fpinfo_o || !fpinfo_o->pushdown_safe ||
 		!fpinfo_i || !fpinfo_i->pushdown_safe)
+		return false;
+
+	/*
+	 * Nested ANTI pushdown is currently unsafe for MonetDB runtime behavior.
+	 * Although alternative remote shapes can be much faster, the current
+	 * experimental implementation is not executor-safe yet. Keep ANTI joins
+	 * local until we have a proven remote path.
+	 */
+	if (jointype == JOIN_ANTI)
 		return false;
 
 	/*
@@ -6650,11 +6779,11 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 				return false;
 			joinclauses = lappend(joinclauses, rinfo);
 		}
-		else if (jointype == JOIN_SEMI)
+		else if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
 		{
 			/*
-			 * All semi-join correlation conditions must be shippable; if any
-			 * cannot be pushed, the whole semi-join cannot be pushed.
+			 * All semi/anti-join correlation conditions must be shippable; if
+			 * any cannot be pushed, the whole join cannot be pushed.
 			 */
 			if (!is_remote_clause)
 				return false;
@@ -6790,6 +6919,13 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			 */
 			break;
 
+		case JOIN_ANTI:
+			/*
+			 * Anti-join follows the same remote shape as semi-join, but the
+			 * deparser emits NOT EXISTS instead of EXISTS.
+			 */
+			break;
+
 		default:
 			/* Should not happen, we have just checked this above */
 			elog(ERROR, "unsupported join type %d", jointype);
@@ -6799,7 +6935,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 * For an inner join, all restrictions can be treated alike. Treating the
 	 * pushed down conditions as join conditions allows a top level full outer
 	 * join to be deparsed without requiring subqueries.
-	 * For a semi join, joinclauses were already set above; leave as-is.
+	 * For a semi/anti join, joinclauses were already set above; leave as-is.
 	 */
 	if (jointype == JOIN_INNER)
 	{
@@ -6809,21 +6945,41 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	}
 
 	/*
-	 * If one of the input relations is a semi-join, the deparser will wrap it
-	 * as an EXISTS-based subquery (sq{N}(c1,c2,...)).  The parent ON clause
-	 * may reference columns from that semi-join that the planner did not put
+	 * If one of the input relations is a semi/anti-join, the deparser will
+	 * wrap it as an EXISTS/NOT EXISTS-based subquery (sq{N}(c1,c2,...)).
+	 * The parent ON clause may reference columns from that join that the
+	 * planner did not put
 	 * in its reltarget (because those columns are only needed for the ON
 	 * clause, not passed further up).  Promote the semi-join to a proper
 	 * named subquery and extend its reltarget with any such missing Vars so
 	 * that get_relation_column_alias_ids can find them.
 	 *
-	 * This is not needed when we are building a SEMI join ourselves: the
-	 * inner rel of a SEMI join is rendered via deparseExistsSubquery (nested
-	 * EXISTS), and the outer rel is just a plain FROM entry.
+	 * This is not needed when we are building a SEMI/ANTI join ourselves:
+	 * the inner rel is rendered via deparseExistsSubquery and the outer rel
+	 * is just a plain FROM entry.
 	 */
 	if (jointype != JOIN_SEMI)
 	{
-		if (IS_JOIN_REL(outerrel) && fpinfo_o->jointype == JOIN_SEMI &&
+		if (pg_monetdb_is_grouped_bridge_rel(outerrel) &&
+			!fpinfo->make_outerrel_subquery)
+		{
+			fpinfo->make_outerrel_subquery = true;
+			fpinfo->lower_subquery_rels =
+				bms_add_members(fpinfo->lower_subquery_rels,
+							outerrel->relids);
+		}
+		if (pg_monetdb_is_grouped_bridge_rel(innerrel) &&
+			!fpinfo->make_innerrel_subquery)
+		{
+			fpinfo->make_innerrel_subquery = true;
+			fpinfo->lower_subquery_rels =
+				bms_add_members(fpinfo->lower_subquery_rels,
+							innerrel->relids);
+		}
+
+		if (IS_JOIN_REL(outerrel) &&
+			(fpinfo_o->jointype == JOIN_SEMI ||
+			 fpinfo_o->jointype == JOIN_ANTI) &&
 			!fpinfo->make_outerrel_subquery)
 		{
 			fpinfo->make_outerrel_subquery = true;
@@ -6833,7 +6989,9 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			add_missing_vars_to_reltarget(outerrel, fpinfo->joinclauses);
 			add_missing_vars_to_reltarget(outerrel, fpinfo->remote_conds);
 		}
-		if (IS_JOIN_REL(innerrel) && fpinfo_i->jointype == JOIN_SEMI &&
+		if (IS_JOIN_REL(innerrel) &&
+			(fpinfo_i->jointype == JOIN_SEMI ||
+			 fpinfo_i->jointype == JOIN_ANTI) &&
 			!fpinfo->make_innerrel_subquery)
 		{
 			fpinfo->make_innerrel_subquery = true;
@@ -6858,6 +7016,11 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	}
 	else
 		fpinfo->user = NULL;
+
+	joinrel->serverid = fpinfo->server->serverid;
+	joinrel->userid = GetUserId();
+	joinrel->useridiscurrent = true;
+	joinrel->fdwroutine = GetFdwRoutineByServerId(joinrel->serverid);
 
 	/*
 	 * Set # of retrieved rows and cached relation costs to some negative
