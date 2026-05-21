@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	158.943	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q02	OK	9.909	FS+LOCAL_SORT	full all.sql run on PostgreSQL 16; top-N sort/limit wrapper above remote Foreign Scan
+Q03	OK	22.188	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q04	OK	85.209	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 16; EXISTS pushed remote, local aggregate/sort remains
+Q05	OK	24.045	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q06	OK	8.919	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q07	OK	57.255	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 16; remote join/filter with local aggregate/sort on EXTRACT expression
+Q08	OK	31.576	FS+LOCAL_SORT	matches baseline shape; local sort above remote Foreign Scan
+Q09	OK	84.825	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q10	OK	208.985	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q11	OK	8.771	FS+INITPLAN	matches baseline shape; remote Foreign Scan plus remote InitPlan
+Q12	OK	54.109	FS+LOCAL_AGG+LOCAL_SORT	baseline had FS+LOCAL_AGG; PostgreSQL 16 keeps a local sort wrapper
+Q13	ISSUE	218.451	FS+LOCAL_AGG+LOCAL_SORT	matches known issue class; remote grouped scan feeds local aggregate/sort
+Q14	OK	4.744	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q15	OK	56.193	MIXED	CREATE VIEW / EXPLAIN / DROP VIEW completed; mixed local and remote execution
+Q16	OK	51.678	FS	matches baseline shape; NOT IN subquery pushdown active
+Q17	OK	35.560	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q18	OK	351.320	FS	matches baseline shape; grouped-subquery join pushdown active
+Q19	OK	45.441	FS	full all.sql run on PostgreSQL 16; single Foreign Scan
+Q20	OK	312.898	FS+LOCAL_SORT	matches baseline shape; remote query with local top sort
+Q21	OK	79.995	FS+LOCAL_LIMIT	remote JOIN_ANTI rewrite still active; PostgreSQL 16 keeps a local Limit wrapper
+Q22	OK	31.634	FS+INITPLAN+LOCAL_AGG+LOCAL_SORT+LOCAL_LIMIT	remote InitPlan and remote NOT EXISTS feed local aggregate; PostgreSQL 16 also keeps local sort/limit wrapper

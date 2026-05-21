@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	151.735	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q02	OK	8.671	FS+LOCAL_SORT	full all.sql run on PostgreSQL 17; top-N sort/limit wrapper above remote Foreign Scan
+Q03	OK	22.270	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q04	OK	91.664	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 17; EXISTS pushed remote, local aggregate/sort remains
+Q05	OK	29.573	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q06	OK	8.546	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q07	OK	52.459	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 17; remote join/filter with local aggregate/sort on EXTRACT expression
+Q08	OK	34.492	FS+LOCAL_SORT	matches baseline shape; local sort above remote Foreign Scan
+Q09	OK	78.982	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q10	OK	204.711	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q11	OK	8.076	FS+INITPLAN	matches baseline shape; remote Foreign Scan plus remote InitPlan
+Q12	OK	54.540	FS+LOCAL_AGG+LOCAL_SORT	baseline had FS+LOCAL_AGG; PostgreSQL 17 keeps a local sort wrapper
+Q13	ISSUE	227.115	FS+LOCAL_AGG+LOCAL_SORT	matches known issue class; remote grouped scan feeds local aggregate/sort
+Q14	OK	6.516	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q15	OK	59.727	MIXED	CREATE VIEW / EXPLAIN / DROP VIEW completed; mixed local and remote execution
+Q16	OK	56.622	FS	matches baseline shape; NOT IN subquery pushdown active
+Q17	OK	32.320	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q18	OK	348.946	FS	grouped-subquery join pushdown restored for PostgreSQL 17 compatibility path
+Q19	OK	43.682	FS	full all.sql run on PostgreSQL 17; single Foreign Scan
+Q20	OK	283.258	FS+LOCAL_SORT	matches baseline shape; remote query with local top sort
+Q21	OK	81.677	FS+LOCAL_LIMIT	remote JOIN_ANTI rewrite still active; PostgreSQL 17 keeps a local Limit wrapper
+Q22	OK	32.343	FS+INITPLAN+LOCAL_AGG+LOCAL_SORT+LOCAL_LIMIT	remote InitPlan and remote NOT EXISTS feed local aggregate; PostgreSQL 17 also keeps local sort/limit wrapper

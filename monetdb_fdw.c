@@ -86,7 +86,11 @@ typedef struct PgMonetdbPlannerTraceContext
 static PlannedStmt *pg_monetdb_planner(Query *parse,
 									  const char *query_string,
 									  int cursorOptions,
-									  ParamListInfo boundParams);
+									  ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+									  , ExplainState *es
+#endif
+									  );
 static void pg_monetdb_create_upper_paths(PlannerInfo *root,
 									 UpperRelationKind stage,
 									 RelOptInfo *input_rel,
@@ -107,7 +111,11 @@ static bool pg_monetdb_query_needs_planner_trace(Query *parse,
 static PlannedStmt *pg_monetdb_plan_with_next(Query *parse,
 								 const char *query_string,
 								 int cursorOptions,
-								 ParamListInfo boundParams);
+								 ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+								 , ExplainState *es
+#endif
+								 );
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
 static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
 										 Oid *relid_out);
@@ -250,7 +258,11 @@ _PG_fini(void)
 
 static PlannedStmt *
 pg_monetdb_planner(Query *parse, const char *query_string,
-				   int cursorOptions, ParamListInfo boundParams)
+				   int cursorOptions, ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+				   , ExplainState *es
+#endif
+				   )
 {
 	bool		trace_active = false;
 	PlannedStmt *result;
@@ -289,7 +301,11 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 	}
 
 	result = pg_monetdb_plan_with_next(parse, query_string,
-						  cursorOptions, boundParams);
+						  cursorOptions, boundParams
+#if PG_VERSION_NUM >= 190000
+						  , es
+#endif
+						  );
 
 	if (trace_active)
 		pg_monetdb_trace_active_depth--;
@@ -299,12 +315,24 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 
 static PlannedStmt *
 pg_monetdb_plan_with_next(Query *parse, const char *query_string,
-					  int cursorOptions, ParamListInfo boundParams)
+					  int cursorOptions, ParamListInfo boundParams
+#if PG_VERSION_NUM >= 190000
+					  , ExplainState *es
+#endif
+					  )
 {
 	if (next_planner_hook)
-		return next_planner_hook(parse, query_string, cursorOptions, boundParams);
+		return next_planner_hook(parse, query_string, cursorOptions, boundParams
+#if PG_VERSION_NUM >= 190000
+						, es
+#endif
+						);
 
-	return standard_planner(parse, query_string, cursorOptions, boundParams);
+	return standard_planner(parse, query_string, cursorOptions, boundParams
+#if PG_VERSION_NUM >= 190000
+					, es
+#endif
+					);
 }
 static void
 pg_monetdb_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
@@ -372,6 +400,7 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 	Query	   *subquery;
 	RangeTblEntry *base_rte;
 	Node	   *fromnode;
+	int			expected_rtable_len;
 
 	if (relid_out != NULL)
 		*relid_out = InvalidOid;
@@ -388,8 +417,15 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 		return false;
 
 	subquery = rte->subquery;
+
+#if PG_VERSION_NUM >= 180000
+	expected_rtable_len = 2;
+#else
+	expected_rtable_len = 1;
+#endif
+
 	if (!subquery->hasAggs || subquery->groupClause == NIL ||
-		list_length(subquery->rtable) != 2 || subquery->hasSubLinks)
+		list_length(subquery->rtable) != expected_rtable_len || subquery->hasSubLinks)
 		return false;
 
 	if (subquery->jointree == NULL || list_length(subquery->jointree->fromlist) != 1)
@@ -602,8 +638,11 @@ pg_monetdb_rtekind_name(RTEKind rtekind)
 			return "RTE_CTE";
 		case RTE_NAMEDTUPLESTORE:
 			return "RTE_NAMEDTUPLESTORE";
+
+#if PG_VERSION_NUM >= 180000
 		case RTE_GROUP:
 			return "RTE_GROUP";
+#endif
 		case RTE_RESULT:
 			return "RTE_RESULT";
 	}

@@ -2137,8 +2137,13 @@ deparseSubqueryTargetList(deparse_expr_cxt *context)
 
 			if (tle->resjunk)
 				continue;
+
+#if PG_VERSION_NUM >= 180000
 			node = flatten_group_exprs(context->root, rte->subquery,
 								  (Node *) tle->expr);
+#else
+			node = (Node *) tle->expr;
+#endif
 		}
 		else
 			node = (Node *) lfirst(lc);
@@ -3399,8 +3404,11 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 
 		inner_var = (Var *) tle->expr;
 		inner_rte = rt_fetch(inner_var->varno, subquery->rtable);
+
+#if PG_VERSION_NUM >= 180000
 		if (inner_rte->rtekind == RTE_GROUP)
 			return false;
+#endif
 		deparseColumnRef(context->buf, inner_var->varno, inner_var->varattno,
 					 inner_rte, false);
 		return true;
@@ -3410,6 +3418,8 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 		return false;
 
 	inner_rte = rt_fetch(node->varno, subquery->rtable);
+
+#if PG_VERSION_NUM >= 180000
 	if (inner_rte->rtekind == RTE_GROUP)
 	{
 		tle = get_tle_by_resno(subquery->targetList, node->varattno);
@@ -3421,6 +3431,7 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 		}
 		return false;
 	}
+#endif
 	if (inner_rte->rtekind != RTE_RELATION)
 		return false;
 
