@@ -119,6 +119,10 @@ static PlannedStmt *pg_monetdb_plan_with_next(Query *parse,
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
 static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
 										 Oid *relid_out);
+static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
+						 Node *fromnode,
+						 Oid *relid_out,
+						 Oid *serverid_out);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   Index rti,
 									   RangeTblEntry *rte,
@@ -398,9 +402,7 @@ static bool
 pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out)
 {
 	Query	   *subquery;
-	RangeTblEntry *base_rte;
 	Node	   *fromnode;
-	int			expected_rtable_len;
 
 	if (relid_out != NULL)
 		*relid_out = InvalidOid;
@@ -418,32 +420,79 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 
 	subquery = rte->subquery;
 
-#if PG_VERSION_NUM >= 180000
-	expected_rtable_len = 2;
-#else
-	expected_rtable_len = 1;
-#endif
-
 	if (!subquery->hasAggs || subquery->groupClause == NIL ||
-		list_length(subquery->rtable) != expected_rtable_len || subquery->hasSubLinks)
+		subquery->hasSubLinks)
 		return false;
 
 	if (subquery->jointree == NULL || list_length(subquery->jointree->fromlist) != 1)
 		return false;
 
 	fromnode = linitial(subquery->jointree->fromlist);
-	if (!IsA(fromnode, RangeTblRef) || ((RangeTblRef *) fromnode)->rtindex != 1)
+	return pg_monetdb_grouped_subquery_find_anchor(subquery, fromnode,
+									 relid_out, NULL);
+}
+
+static bool
+pg_monetdb_grouped_subquery_find_anchor(Query *subquery, Node *fromnode,
+						 Oid *relid_out, Oid *serverid_out)
+{
+	if (fromnode == NULL)
 		return false;
 
-	base_rte = rt_fetch(1, subquery->rtable);
-	if (base_rte->rtekind != RTE_RELATION ||
-		get_rel_relkind(base_rte->relid) != RELKIND_FOREIGN_TABLE)
-		return false;
+	if (IsA(fromnode, RangeTblRef))
+	{
+		RangeTblEntry *base_rte;
+		Oid			base_serverid;
+		Oid			base_relid;
 
-	if (relid_out != NULL)
-		*relid_out = base_rte->relid;
+		base_rte = rt_fetch(((RangeTblRef *) fromnode)->rtindex, subquery->rtable);
+		if (base_rte->rtekind != RTE_RELATION ||
+			get_rel_relkind(base_rte->relid) != RELKIND_FOREIGN_TABLE)
+			return false;
 
-	return true;
+		base_relid = base_rte->relid;
+		base_serverid = GetForeignTable(base_relid)->serverid;
+
+		if (serverid_out != NULL && OidIsValid(*serverid_out) &&
+			*serverid_out != base_serverid)
+			return false;
+
+		if (relid_out != NULL && !OidIsValid(*relid_out))
+			*relid_out = base_relid;
+		if (serverid_out != NULL)
+			*serverid_out = base_serverid;
+
+		return true;
+	}
+
+	if (IsA(fromnode, JoinExpr))
+	{
+		JoinExpr   *joinexpr = (JoinExpr *) fromnode;
+		Oid			anchor_relid = relid_out != NULL ? *relid_out : InvalidOid;
+		Oid			anchor_serverid = serverid_out != NULL ? *serverid_out : InvalidOid;
+
+		if (joinexpr->jointype != JOIN_INNER)
+			return false;
+
+		if (!pg_monetdb_grouped_subquery_find_anchor(subquery, joinexpr->larg,
+									 &anchor_relid,
+									 &anchor_serverid))
+			return false;
+
+		if (!pg_monetdb_grouped_subquery_find_anchor(subquery, joinexpr->rarg,
+									 &anchor_relid,
+									 &anchor_serverid))
+			return false;
+
+		if (relid_out != NULL)
+			*relid_out = anchor_relid;
+		if (serverid_out != NULL)
+			*serverid_out = anchor_serverid;
+
+		return true;
+	}
+
+	return false;
 }
 
 static void

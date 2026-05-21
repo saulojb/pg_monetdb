@@ -210,6 +210,10 @@ static bool is_subquery_var(Var *node, RelOptInfo *foreignrel,
 static bool is_grouped_subquery_bridge(RelOptInfo *rel);
 static bool deparse_grouped_subquery_bridge_var(Var *node,
 							deparse_expr_cxt *context);
+static void deparse_grouped_subquery_from_node(StringInfo buf,
+							 Query *subquery,
+							 Node *node,
+							 deparse_expr_cxt *context);
 static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 										  int *relno, int *colno);
 
@@ -2300,34 +2304,92 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	else
 	{
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
-		Relation	rel;
-		RangeTblEntry *base_rte = rte;
 
 		if (is_grouped_subquery_bridge(foreignrel))
 		{
 			Assert(rte->rtekind == RTE_SUBQUERY);
 			Assert(rte->subquery != NULL);
-			base_rte = rt_fetch(1, rte->subquery->rtable);
+			deparse_grouped_subquery_from_node(buf, rte->subquery,
+									 linitial(rte->subquery->jointree->fromlist),
+									 &(deparse_expr_cxt) {
+										.root = root,
+										.foreignrel = foreignrel,
+										.scanrel = foreignrel,
+										.buf = buf,
+										.params_list = params_list,
+									 });
+			return;
 		}
+		else
+		{
+			Relation	rel;
 
-		/*
-		 * Core code already has some lock on each rel being planned, so we
-		 * can use NoLock here.
-		 */
-		rel = table_open(base_rte->relid, NoLock);
+			/*
+			 * Core code already has some lock on each rel being planned, so we
+			 * can use NoLock here.
+			 */
+			rel = table_open(rte->relid, NoLock);
 
-		deparseRelation(buf, rel);
+			deparseRelation(buf, rel);
 
-		/*
-		 * Add a unique alias to avoid any conflict in relation names due to
-		 * pulled up subqueries in the query being built for a pushed down
-		 * join.
-		 */
-		if (use_alias)
-			appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, foreignrel->relid);
+			/*
+			 * Add a unique alias to avoid any conflict in relation names due to
+			 * pulled up subqueries in the query being built for a pushed down
+			 * join.
+			 */
+			if (use_alias)
+				appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, foreignrel->relid);
 
-		table_close(rel, NoLock);
+			table_close(rel, NoLock);
+		}
 	}
+}
+
+static void
+deparse_grouped_subquery_from_node(StringInfo buf, Query *subquery, Node *node,
+						 deparse_expr_cxt *context)
+{
+	if (IsA(node, RangeTblRef))
+	{
+		int			 rtindex = ((RangeTblRef *) node)->rtindex;
+		RangeTblEntry *rte = rt_fetch(rtindex, subquery->rtable);
+		Relation	rel;
+
+		Assert(rte->rtekind == RTE_RELATION);
+
+		rel = table_open(rte->relid, NoLock);
+		deparseRelation(buf, rel);
+		appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, rtindex);
+		table_close(rel, NoLock);
+		return;
+	}
+
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *joinexpr = (JoinExpr *) node;
+
+		appendStringInfoChar(buf, '(');
+		deparse_grouped_subquery_from_node(buf, subquery, joinexpr->larg,
+							   context);
+		appendStringInfo(buf, " %s JOIN ",
+					 get_jointype_name(joinexpr->jointype));
+		deparse_grouped_subquery_from_node(buf, subquery, joinexpr->rarg,
+							   context);
+		appendStringInfoString(buf, " ON ");
+		if (joinexpr->quals != NULL)
+		{
+			appendStringInfoChar(buf, '(');
+			appendConditions(make_ands_implicit((Expr *) joinexpr->quals),
+						 context);
+			appendStringInfoChar(buf, ')');
+		}
+		else
+			appendStringInfoString(buf, "(TRUE)");
+		appendStringInfoChar(buf, ')');
+		return;
+	}
+
+	elog(ERROR, "unsupported grouped subquery FROM node: %d", (int) nodeTag(node));
 }
 
 /*
@@ -3410,7 +3472,7 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 			return false;
 #endif
 		deparseColumnRef(context->buf, inner_var->varno, inner_var->varattno,
-					 inner_rte, false);
+					 inner_rte, true);
 		return true;
 	}
 
@@ -3436,7 +3498,7 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 		return false;
 
 	deparseColumnRef(context->buf, node->varno, node->varattno, inner_rte,
-				 false);
+				 true);
 	return true;
 }
 
