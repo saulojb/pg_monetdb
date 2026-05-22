@@ -133,8 +133,6 @@ static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
 static List *pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 								  RelOptInfo *foreignrel);
-static List *pg_monetdb_normalize_foreignscan_tlist(List *tlist,
-									   List *fdw_scan_tlist);
 static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid);
@@ -685,50 +683,10 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 					makeTargetEntry((Expr *) var,
 								 subquery_tle->resno,
 								 subquery_tle->resname,
-								 false));
+							 false));
 	}
 
 	return tlist;
-}
-
-static List *
-pg_monetdb_normalize_foreignscan_tlist(List *tlist, List *fdw_scan_tlist)
-{
-	List	   *normalized = NIL;
-	ListCell   *lc;
-
-	foreach(lc, tlist)
-	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-		TargetEntry *new_tle = copyObject(tle);
-		ListCell   *scan_lc;
-
-		if (!tle->resjunk)
-		{
-			foreach(scan_lc, fdw_scan_tlist)
-			{
-				TargetEntry *scan_tle = lfirst_node(TargetEntry, scan_lc);
-
-				if (scan_tle->resjunk)
-					continue;
-
-				if (equal(tle->expr, scan_tle->expr))
-				{
-					new_tle->expr = (Expr *) makeVar(OUTER_VAR,
-										 scan_tle->resno,
-										 exprType((Node *) scan_tle->expr),
-										 exprTypmod((Node *) scan_tle->expr),
-										 exprCollation((Node *) scan_tle->expr),
-										 0);
-					break;
-				}
-			}
-		}
-
-		normalized = lappend(normalized, new_tle);
-	}
-
-	return normalized;
 }
 
 static void
@@ -2395,11 +2353,6 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 
 	/* Remember remote_exprs for possible use by PlanDirectModify */
 	fpinfo->final_remote_exprs = remote_exprs;
-
-	if (scan_relid == 0 && fdw_scan_tlist != NIL &&
-		pg_monetdb_is_grouped_bridge_rel(foreignrel))
-		tlist = pg_monetdb_normalize_foreignscan_tlist(tlist,
-									   fdw_scan_tlist);
 
 	/*
 	 * Build the fdw_private list that will be available to the executor.
