@@ -1350,14 +1350,14 @@ build_tlist_to_deparse(RelOptInfo *foreignrel)
 	 */
 	tlist = add_to_flat_tlist(tlist,
 							  pull_var_clause((Node *) foreignrel->reltarget->exprs,
-											  PVC_RECURSE_PLACEHOLDERS));
+										 PVC_RECURSE_PLACEHOLDERS));
 	foreach(lc, fpinfo->local_conds)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
 		tlist = add_to_flat_tlist(tlist,
 								  pull_var_clause((Node *) rinfo->clause,
-												  PVC_RECURSE_PLACEHOLDERS));
+											 PVC_RECURSE_PLACEHOLDERS));
 	}
 
 	return tlist;
@@ -3174,11 +3174,69 @@ deparse_subquery_column_ref(StringInfo buf, int varno, int varattno,
 						  RangeTblEntry *rte, bool qualify_col)
 {
 	TargetEntry *tle;
+	ListCell   *lc;
+	RangeTblEntry *base_rte = NULL;
 	Var		   *inner_var;
 	RangeTblEntry *inner_rte;
 	char	   *colname;
 
 	tle = get_tle_by_resno(rte->subquery->targetList, varattno);
+	if (tle == NULL && !OidIsValid(rte->relid))
+	{
+		foreach(lc, rte->subquery->targetList)
+		{
+			TargetEntry *candidate = lfirst_node(TargetEntry, lc);
+
+			if (candidate->resjunk || !IsA(candidate->expr, Var))
+				continue;
+
+			inner_var = (Var *) candidate->expr;
+			if (inner_var->varattno == varattno)
+			{
+				tle = candidate;
+				break;
+			}
+		}
+	}
+
+	if (tle == NULL && !OidIsValid(rte->relid))
+	{
+		if (rte->subquery->jointree != NULL &&
+			list_length(rte->subquery->jointree->fromlist) == 1 &&
+			IsA(linitial(rte->subquery->jointree->fromlist), RangeTblRef))
+		{
+			base_rte = rt_fetch(((RangeTblRef *) linitial(rte->subquery->jointree->fromlist))->rtindex,
+							 rte->subquery->rtable);
+
+			if (base_rte->rtekind == RTE_RELATION)
+			{
+				const char *base_colname = get_attname(base_rte->relid, varattno, false);
+
+				foreach(lc, rte->subquery->targetList)
+				{
+					TargetEntry *candidate = lfirst_node(TargetEntry, lc);
+
+					if (candidate->resjunk || candidate->resname == NULL)
+						continue;
+
+					if (strcmp(candidate->resname, base_colname) == 0)
+					{
+						tle = candidate;
+						break;
+					}
+				}
+
+				if (tle == NULL)
+				{
+					if (qualify_col)
+						ADD_REL_QUALIFIER(buf, varno);
+					appendStringInfoString(buf, quote_identifier(base_colname));
+					return true;
+				}
+			}
+		}
+	}
+
 	if (tle == NULL || tle->resjunk)
 		return false;
 
@@ -3254,12 +3312,7 @@ deparseStringLiteral(StringInfo buf, const char *val)
 {
 	const char *valptr;
 
-	/*
-	 * Rather than making assumptions about the remote server's value of
-	 * standard_conforming_strings, always use E'foo' syntax if there are any
-	 * backslashes.  This will fail on remote servers before 8.1, but those
-	 * are long out of support.
-	 */
+	/* Use escape string syntax when backslashes need to be preserved. */
 	if (strchr(val, '\\') != NULL)
 		appendStringInfoChar(buf, ESCAPE_STRING_SYNTAX);
 	appendStringInfoChar(buf, '\'');
@@ -3356,13 +3409,11 @@ static void
 deparseVar(Var *node, deparse_expr_cxt *context)
 {
 	Relids		relids = context->scanrel->relids;
-	MonetdbFdwRelationInfo *scan_fpinfo;
 	int			relno;
 	int			colno;
 
 	/* Qualify columns when multiple relations are involved. */
 	bool		qualify_col = (bms_membership(relids) == BMS_MULTIPLE);
-	scan_fpinfo = (MonetdbFdwRelationInfo *) context->scanrel->fdw_private;
 
 	if (is_grouped_subquery_bridge(context->scanrel) &&
 		context->foreignrel != context->scanrel &&
@@ -3370,11 +3421,12 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 		bms_is_member(node->varno, relids) &&
 		node->varattno > 0)
 	{
+		get_relation_column_alias_ids(node, context->scanrel, &relno, &colno);
 		appendStringInfo(context->buf, "%s%d.%s%d",
 						 SUBQUERY_REL_ALIAS_PREFIX,
-						 scan_fpinfo->relation_index,
+					 relno,
 						 SUBQUERY_COL_ALIAS_PREFIX,
-						 node->varattno);
+					 colno);
 		return;
 	}
 
@@ -4961,12 +5013,6 @@ get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 
 	/* Get the relation alias ID */
 	*relno = fpinfo->relation_index;
-
-	if (is_grouped_subquery_bridge(foreignrel))
-	{
-		*colno = node->varattno;
-		return;
-	}
 
 	/* Get the column alias ID */
 	i = 1;

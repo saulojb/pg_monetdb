@@ -5310,6 +5310,15 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		output_rel->fdw_private)
 		return;
 
+	/*
+	 * Separately planned subqueries/CTEs need their grouping output preserved
+	 * as a local subplan boundary.  Pushing GROUP_AGG here can leave planner
+	 * bookkeeping expecting subplan target entries that the foreign path does
+	 * not expose correctly for materialized consumers.
+	 */
+	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
+		return;
+
 	fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
 	fpinfo->pushdown_safe = false;
 	fpinfo->stage = stage;
@@ -6842,6 +6851,15 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	MonetdbFdwRelationInfo *fpinfo_i;
 	ListCell   *lc;
 	List	   *joinclauses;
+
+	/*
+	 * Materialized CTEs and other separately planned subqueries need a stable
+	 * local aggregate boundary above their joins.  Let the core planner build
+	 * that local join+aggregate shape instead of pushing the join down here.
+	 */
+	if (root->parent_root != NULL &&
+		(root->parse->hasAggs || root->parse->groupClause != NIL))
+		return false;
 
 	/*
 	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, SEMI, and ANTI
