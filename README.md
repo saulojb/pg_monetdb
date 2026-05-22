@@ -149,6 +149,14 @@ Typical invocation:
 sudo -n -u postgres psql -X -p 5433 -d monet_test -f sql/materialized_cte_manual.sql
 ```
 
+For grouped grouped-subquery bridge validation with a local window stage above a pushed-down grouped CTE, see [grouped_bridge_window_manual.sql](./sql/grouped_bridge_window_manual.sql).
+
+Typical invocation:
+
+```sh
+sudo -n -u postgres psql -X -p 5433 -d monet_test -f sql/grouped_bridge_window_manual.sql
+```
+
 #### Limits
 
 Primary Key is required for DELETE and UPDATE operations.
