@@ -128,6 +128,8 @@ static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   RangeTblEntry *rte,
 									   Oid relid);
 static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
+static List *pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
+								  RelOptInfo *foreignrel);
 static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid);
@@ -564,6 +566,45 @@ pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel)
 
 	fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
 	return (!IS_UPPER_REL(rel) && fpinfo->stage == UPPERREL_GROUP_AGG);
+}
+
+static List *
+pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
+								  RelOptInfo *foreignrel)
+{
+	RangeTblEntry *rte;
+	List	   *tlist = NIL;
+	ListCell   *lc;
+
+	Assert(pg_monetdb_is_grouped_bridge_rel(foreignrel));
+
+	rte = planner_rt_fetch(foreignrel->relid, root);
+	Assert(rte->rtekind == RTE_SUBQUERY);
+	Assert(rte->subquery != NULL);
+
+	foreach(lc, rte->subquery->targetList)
+	{
+		TargetEntry *subquery_tle = lfirst_node(TargetEntry, lc);
+		Var	   *var;
+
+		if (subquery_tle->resjunk)
+			continue;
+
+		var = makeVar(foreignrel->relid,
+				  subquery_tle->resno,
+				  exprType((Node *) subquery_tle->expr),
+				  exprTypmod((Node *) subquery_tle->expr),
+				  exprCollation((Node *) subquery_tle->expr),
+				  0);
+
+		tlist = lappend(tlist,
+					makeTargetEntry((Expr *) var,
+								 subquery_tle->resno,
+								 subquery_tle->resname,
+								 false));
+	}
+
+	return tlist;
 }
 
 static void
@@ -2014,7 +2055,8 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 		scan_relid = grouped_bridge ? 0 : foreignrel->relid;
 
 		if (grouped_bridge)
-			fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
+			fdw_scan_tlist = pg_monetdb_build_grouped_bridge_scan_tlist(root,
+										 foreignrel);
 
 		/*
 		 * In a base-relation scan, we must apply the given scan_clauses.

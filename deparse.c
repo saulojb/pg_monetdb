@@ -1023,6 +1023,10 @@ foreign_expr_walker(Node *node,
 				if (agg->aggsplit != AGGSPLIT_SIMPLE)
 					return false;
 
+				/* MonetDB does not support SQL FILTER on aggregates. */
+				if (agg->aggfilter != NULL)
+					return false;
+
 				/* As usual, it must be shippable. */
 				if (!is_shippable(agg->aggfnoid, ProcedureRelationId, fpinfo))
 					return false;
@@ -2523,7 +2527,24 @@ deparseRangeTblRef(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		 * expressions specified in the relation's reltarget (see
 		 * deparseSubqueryTargetList).
 		 */
-		ncols = list_length(foreignrel->reltarget->exprs);
+		if (is_grouped_subquery_bridge(foreignrel))
+		{
+			RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+			ListCell   *lc;
+
+			ncols = 0;
+			Assert(rte->rtekind == RTE_SUBQUERY);
+			Assert(rte->subquery != NULL);
+			foreach(lc, rte->subquery->targetList)
+			{
+				TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+				if (!tle->resjunk)
+					ncols++;
+			}
+		}
+		else
+			ncols = list_length(foreignrel->reltarget->exprs);
 		if (ncols > 0)
 		{
 			int			i;
@@ -5161,6 +5182,16 @@ get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 
 	/* Get the relation alias ID */
 	*relno = fpinfo->relation_index;
+
+	/*
+	 * Grouped bridges emitted as subqueries expose columns in the original
+	 * subquery output order, so preserve the bridge output attno directly.
+	 */
+	if (is_grouped_subquery_bridge(foreignrel) && node->varattno > 0)
+	{
+		*colno = node->varattno;
+		return;
+	}
 
 	/* Get the column alias ID */
 	i = 1;
