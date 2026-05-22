@@ -160,6 +160,7 @@ static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context);
+static void deparseCoalesceExpr(CoalesceExpr *node, deparse_expr_cxt *context);
 static void deparseMinMaxExpr(MinMaxExpr *node, deparse_expr_cxt *context);
 static void deparseArrayExpr(ArrayExpr *node, deparse_expr_cxt *context);
 static void printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
@@ -196,6 +197,8 @@ static void appendSubPlanSqlTemplate(SubPlan *subplan, ForeignScan *fscan,
 static void appendGroupByClause(List *tlist, deparse_expr_cxt *context);
 static void appendGroupByClauseForQuery(List *tlist, Query *query,
 							deparse_expr_cxt *context);
+static void appendGroupingSetContent(List *content, List *tlist,
+							deparse_expr_cxt *context, bool in_grouping_sets);
 static void appendOrderBySuffix(Oid sortop, Oid sortcoltype, bool nulls_first,
 								deparse_expr_cxt *context);
 static void appendAggOrderBy(List *orderList, List *targetList,
@@ -890,6 +893,26 @@ foreign_expr_walker(Node *node,
 				 * the THEN and ELSE subexpressions.
 				 */
 				collation = ce->casecollid;
+				if (collation == InvalidOid)
+					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 collation == inner_cxt.collation)
+					state = FDW_COLLATE_SAFE;
+				else if (collation == DEFAULT_COLLATION_OID)
+					state = FDW_COLLATE_NONE;
+				else
+					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *ce = (CoalesceExpr *) node;
+
+				if (!foreign_expr_walker((Node *) ce->args,
+									 glob_cxt, &inner_cxt, case_arg_cxt))
+					return false;
+
+				collation = ce->coalescecollid;
 				if (collation == InvalidOid)
 					state = FDW_COLLATE_NONE;
 				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
@@ -3487,6 +3510,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_CaseExpr:
 			deparseCaseExpr((CaseExpr *) node, context);
 			break;
+		case T_CoalesceExpr:
+			deparseCoalesceExpr((CoalesceExpr *) node, context);
+			break;
 		case T_MinMaxExpr:
 			deparseMinMaxExpr((MinMaxExpr *) node, context);
 			break;
@@ -4472,6 +4498,25 @@ deparseMinMaxExpr(MinMaxExpr *node, deparse_expr_cxt *context)
 }
 
 /*
+ * Deparse COALESCE(...).
+ */
+static void
+deparseCoalesceExpr(CoalesceExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	ListCell   *lc;
+
+	appendStringInfoString(buf, "COALESCE(");
+	foreach(lc, node->args)
+	{
+		if (lc != list_head(node->args))
+			appendStringInfoString(buf, ", ");
+		deparseExpr((Expr *) lfirst(lc), context);
+	}
+	appendStringInfoChar(buf, ')');
+}
+
+/*
  * Deparse ARRAY[...] construct.
  */
 static void
@@ -4832,12 +4877,30 @@ appendGroupByClauseForQuery(List *tlist, Query *query,
 	ListCell   *lc;
 	bool		first = true;
 
-	if (query == NULL || !query->groupClause)
+	if (query == NULL || (!query->groupClause && !query->groupingSets))
 		return;
 
 	appendStringInfoString(buf, " GROUP BY ");
 
-	Assert(!query->groupingSets);
+	if (query->groupingSets)
+	{
+		appendStringInfoString(buf, "GROUPING SETS (");
+		foreach(lc, query->groupingSets)
+		{
+			List	   *grouping_set = lfirst(lc);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			if (grouping_set == NIL)
+				appendStringInfoString(buf, "()");
+			else
+				appendGroupingSetContent(grouping_set, tlist, context, true);
+		}
+		appendStringInfoChar(buf, ')');
+		return;
+	}
 
 	foreach(lc, query->groupClause)
 	{
@@ -4849,6 +4912,38 @@ appendGroupByClauseForQuery(List *tlist, Query *query,
 
 		deparseSortGroupClause(grp->tleSortGroupRef, tlist, true, context);
 	}
+}
+static void
+appendGroupingSetContent(List *content, List *tlist,
+					 deparse_expr_cxt *context, bool in_grouping_sets)
+{
+	StringInfo	buf = context->buf;
+	ListCell   *lc;
+	bool		first = true;
+
+	if (content == NIL)
+		return;
+
+	if (content->type == T_IntList)
+	{
+		if (in_grouping_sets || list_length(content) != 1)
+			appendStringInfoChar(buf, '(');
+
+		foreach(lc, content)
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			deparseSortGroupClause(lfirst_int(lc), tlist, false, context);
+		}
+
+		if (in_grouping_sets || list_length(content) != 1)
+			appendStringInfoChar(buf, ')');
+		return;
+	}
+
+	elog(ERROR, "unsupported grouping set content type: %d", (int) content->type);
 }
 
 /*

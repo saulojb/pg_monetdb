@@ -123,6 +123,9 @@ static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
 						 Node *fromnode,
 						 Oid *relid_out,
 						 Oid *serverid_out);
+static bool pg_monetdb_fromnode_has_join(Node *node);
+static bool pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root);
+static bool pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   Index rti,
 									   RangeTblEntry *rte,
@@ -130,6 +133,8 @@ static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
 static List *pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 								  RelOptInfo *foreignrel);
+static List *pg_monetdb_normalize_foreignscan_tlist(List *tlist,
+									   List *fdw_scan_tlist);
 static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid);
@@ -380,6 +385,7 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	bool			grouped_bridge = false;
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
+		pg_monetdb_should_attach_grouped_bridge(root) &&
 		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
 	{
 		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, rte, derived_relid);
@@ -568,6 +574,84 @@ pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel)
 	return (!IS_UPPER_REL(rel) && fpinfo->stage == UPPERREL_GROUP_AGG);
 }
 
+static bool
+pg_monetdb_fromnode_has_join(Node *node)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, JoinExpr))
+		return true;
+
+	if (IsA(node, FromExpr))
+	{
+		FromExpr   *fromexpr = (FromExpr *) node;
+		ListCell   *lc;
+
+		foreach(lc, fromexpr->fromlist)
+		{
+			if (pg_monetdb_fromnode_has_join((Node *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root)
+{
+	if (root == NULL || root->parse == NULL)
+		return false;
+
+	if ((root->parse->hasAggs || root->parse->groupClause != NIL) &&
+		!pg_monetdb_fromnode_has_join((Node *) root->parse->jointree))
+		return false;
+
+	return true;
+}
+
+static bool
+pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root)
+{
+	PlannerInfo *parent_root;
+	ListCell   *lc;
+	int			matches = 0;
+
+	if (root == NULL || root->parent_root == NULL || root->parse == NULL)
+		return false;
+
+	parent_root = root->parent_root;
+
+	if (parent_root->parse == NULL)
+		return false;
+
+	if (!pg_monetdb_fromnode_has_join((Node *) parent_root->parse->jointree))
+		return false;
+
+	foreach(lc, parent_root->parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->ctequery != (Node *) root->parse)
+			continue;
+
+		return (cte->ctematerialized != CTEMaterializeAlways &&
+				cte->cterefcount == 1 &&
+				!cte->cterecursive);
+	}
+
+	foreach(lc, parent_root->parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery == root->parse)
+			matches++;
+	}
+
+	return matches == 1;
+}
+
 static List *
 pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 								  RelOptInfo *foreignrel)
@@ -605,6 +689,46 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 	}
 
 	return tlist;
+}
+
+static List *
+pg_monetdb_normalize_foreignscan_tlist(List *tlist, List *fdw_scan_tlist)
+{
+	List	   *normalized = NIL;
+	ListCell   *lc;
+
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		TargetEntry *new_tle = copyObject(tle);
+		ListCell   *scan_lc;
+
+		if (!tle->resjunk)
+		{
+			foreach(scan_lc, fdw_scan_tlist)
+			{
+				TargetEntry *scan_tle = lfirst_node(TargetEntry, scan_lc);
+
+				if (scan_tle->resjunk)
+					continue;
+
+				if (equal(tle->expr, scan_tle->expr))
+				{
+					new_tle->expr = (Expr *) makeVar(OUTER_VAR,
+										 scan_tle->resno,
+										 exprType((Node *) scan_tle->expr),
+										 exprTypmod((Node *) scan_tle->expr),
+										 exprCollation((Node *) scan_tle->expr),
+										 0);
+					break;
+				}
+			}
+		}
+
+		normalized = lappend(normalized, new_tle);
+	}
+
+	return normalized;
 }
 
 static void
@@ -2248,6 +2372,11 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 
 	/* Remember remote_exprs for possible use by PlanDirectModify */
 	fpinfo->final_remote_exprs = remote_exprs;
+
+	if (scan_relid == 0 && fdw_scan_tlist != NIL &&
+		pg_monetdb_is_grouped_bridge_rel(foreignrel))
+		tlist = pg_monetdb_normalize_foreignscan_tlist(tlist,
+									   fdw_scan_tlist);
 
 	/*
 	 * Build the fdw_private list that will be available to the executor.
@@ -5182,10 +5311,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	int			i;
 	List	   *tlist = NIL;
 
-	/* We currently don't support pushing Grouping Sets. */
-	if (query->groupingSets)
-		return false;
-
 	/* Get the fpinfo of the underlying scan relation. */
 	ofpinfo = (MonetdbFdwRelationInfo *) fpinfo->outerrel->fdw_private;
 
@@ -5435,12 +5560,24 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
+	 * A plain aggregate on top of a grouped-bridge subquery still needs a
+	 * local boundary.  Pushing another GROUP_AGG over a bare grouped bridge
+	 * leads setrefs/planner bookkeeping to look for subplan attrs that the
+	 * relid-0 ForeignScan does not expose in this shape.
+	 */
+	if (stage == UPPERREL_GROUP_AGG &&
+		pg_monetdb_is_grouped_bridge_rel(input_rel) &&
+		!pg_monetdb_fromnode_has_join((Node *) root->parse->jointree))
+		return;
+
+	/*
 	 * Separately planned subqueries/CTEs need their grouping output preserved
 	 * as a local subplan boundary.  Pushing GROUP_AGG here can leave planner
 	 * bookkeeping expecting subplan target entries that the foreign path does
 	 * not expose correctly for materialized consumers.
 	 */
-	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
+	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL &&
+		!pg_monetdb_is_single_consumer_nested_query(root))
 		return;
 
 	fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
@@ -6982,7 +7119,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 * that local join+aggregate shape instead of pushing the join down here.
 	 */
 	if (root->parent_root != NULL &&
-		(root->parse->hasAggs || root->parse->groupClause != NIL))
+		(root->parse->hasAggs || root->parse->groupClause != NIL) &&
+		!pg_monetdb_is_single_consumer_nested_query(root))
 		return false;
 
 	/*
