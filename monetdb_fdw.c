@@ -657,6 +657,7 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 	RangeTblEntry *rte;
 	List	   *tlist = NIL;
 	ListCell   *lc;
+	AttrNumber	output_attno = 1;
 
 	Assert(pg_monetdb_is_grouped_bridge_rel(foreignrel));
 
@@ -673,7 +674,7 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 			continue;
 
 		var = makeVar(foreignrel->relid,
-				  subquery_tle->resno,
+				  output_attno,
 				  exprType((Node *) subquery_tle->expr),
 				  exprTypmod((Node *) subquery_tle->expr),
 				  exprCollation((Node *) subquery_tle->expr),
@@ -681,9 +682,10 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 
 		tlist = lappend(tlist,
 					makeTargetEntry((Expr *) var,
-								 subquery_tle->resno,
+								 output_attno,
 								 subquery_tle->resname,
 							 false));
+		output_attno++;
 	}
 
 	return tlist;
@@ -728,23 +730,10 @@ pg_monetdb_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 
 	if (next_set_join_pathlist_hook)
 		next_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
-					   jointype, extra);
-}
-
-static bool
-pg_monetdb_query_needs_planner_trace(Query *parse, const char *query_string)
-{
-	if (parse->hasSubLinks && parse->hasAggs)
-		return true;
-
-	if (query_string == NULL)
-		return false;
-
-	if (strstr(query_string, "l_orderkey") != NULL &&
-		strstr(query_string, "sum(l_quantity)") != NULL)
-		return true;
-
-	return false;
+						   jointype, extra);
+	else
+		MonetDB_GetForeignJoinPaths(root, joinrel, outerrel, innerrel,
+						   jointype, extra);
 }
 
 static bool
@@ -771,6 +760,22 @@ pg_monetdb_find_grouped_any_sublink(Node *node, void *context)
 
 	return expression_tree_walker(node, pg_monetdb_find_grouped_any_sublink,
 						  context);
+}
+
+static bool
+pg_monetdb_query_needs_planner_trace(Query *parse, const char *query_string)
+{
+	if (parse->hasSubLinks && parse->hasAggs)
+		return true;
+
+	if (query_string == NULL)
+		return false;
+
+	if (strstr(query_string, "l_orderkey") != NULL &&
+		strstr(query_string, "sum(l_quantity)") != NULL)
+		return true;
+
+	return false;
 }
 
 static void

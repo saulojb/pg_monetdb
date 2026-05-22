@@ -39,6 +39,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
+#include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "monetdb_fdw.h"
 #include "utils/array.h"
@@ -222,6 +223,31 @@ static void deparse_grouped_subquery_from_node(StringInfo buf,
 							 deparse_expr_cxt *context);
 static void get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 										  int *relno, int *colno);
+static TargetEntry *get_nth_visible_tle(List *tlist, AttrNumber attno);
+
+static TargetEntry *
+get_nth_visible_tle(List *tlist, AttrNumber attno)
+{
+	AttrNumber	visible_attno = 0;
+	ListCell   *lc;
+
+	if (attno <= 0)
+		return NULL;
+
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+
+		visible_attno++;
+		if (visible_attno == attno)
+			return tle;
+	}
+
+	return NULL;
+}
 
 static Expr *
 get_supported_any_sublink_outer_expr(SubPlan *subplan)
@@ -1455,7 +1481,8 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 						bool has_final_sort, bool has_limit, bool is_subquery,
 						List **retrieved_attrs, List **params_list)
 {
-	deparse_expr_cxt context;
+	deparse_expr_cxt context = {0};
+	deparse_expr_cxt grouped_context = {0};
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
 	List	   *quals;
 	bool		grouped_bridge = is_grouped_subquery_bridge(rel);
@@ -1491,9 +1518,12 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.scanrel = grouped_bridge ? rel :
 		(IS_UPPER_REL(rel) ? fpinfo->outerrel : rel);
 	context.params_list = params_list;
+	grouped_context = context;
+	grouped_context.grouped_subquery_inner = grouped_bridge;
 
 	/* Construct SELECT clause */
-	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
+	deparseSelectSql(tlist, is_subquery, retrieved_attrs,
+				 grouped_bridge ? &grouped_context : &context);
 
 	/*
 	 * For upper relations, the WHERE clause is built from the remote
@@ -1516,7 +1546,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 		quals = remote_conds;
 
 	/* Construct FROM and WHERE clauses */
-	deparseFromExpr(quals, &context); 
+	deparseFromExpr(quals, grouped_bridge ? &grouped_context : &context);
 
 	if (IS_UPPER_REL(rel) || grouped_bridge)
 	{
@@ -1531,20 +1561,21 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 		{
 			appendStringInfoString(buf, " HAVING ");
 			appendConditions(grouped_bridge ? bridge_having : remote_conds,
-					 &context);
+					 grouped_bridge ? &grouped_context : &context);
 		}
 	}
 
 	/* Add ORDER BY clause if we found any useful pathkeys */
 	if (pathkeys)
-		appendOrderByClause(pathkeys, has_final_sort, tlist, &context);
+		appendOrderByClause(pathkeys, has_final_sort, tlist,
+					grouped_bridge ? &grouped_context : &context);
 
 	/* Add LIMIT clause if necessary */
 	if (has_limit)
-		appendLimitClause(&context);
+		appendLimitClause(grouped_bridge ? &grouped_context : &context);
 
 	/* Add any necessary FOR UPDATE/SHARE. */
-	deparseLockingClause(&context);
+	deparseLockingClause(grouped_bridge ? &grouped_context : &context);
 }
 
 static bool
@@ -1604,6 +1635,7 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 		{
 			RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
 			ListCell   *tlc;
+			AttrNumber	output_attno = 1;
 
 			Assert(rte->rtekind == RTE_SUBQUERY);
 			Assert(rte->subquery != NULL);
@@ -1627,7 +1659,7 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 					var = (Var *) scan_tle->expr;
 					if (var->varlevelsup == 0 &&
 						var->varno == foreignrel->relid &&
-						var->varattno == tle->resno)
+						var->varattno == output_attno)
 					{
 						matching_tle = scan_tle;
 						break;
@@ -1637,10 +1669,11 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 				if (matching_tle == NULL)
 					elog(ERROR,
 						 "could not map grouped bridge output column %d into fdw_scan_tlist",
-						 tle->resno);
+						 output_attno);
 
 				*retrieved_attrs = lappend_int(*retrieved_attrs,
 								   matching_tle->resno);
+				output_attno++;
 			}
 		}
 	}
@@ -2245,6 +2278,7 @@ deparseSubqueryTargetList(deparse_expr_cxt *context)
 	foreach(lc, target_exprs != NIL ? target_exprs : foreignrel->reltarget->exprs)
 	{
 		Node	   *node;
+		deparse_expr_cxt inner_context = *context;
 
 		if (target_exprs != NIL)
 		{
@@ -2267,7 +2301,10 @@ deparseSubqueryTargetList(deparse_expr_cxt *context)
 			appendStringInfoString(buf, ", ");
 		first = false;
 
-		deparseExpr((Expr *) node, context);
+		if (target_exprs != NIL)
+			inner_context.grouped_subquery_inner = true;
+
+		deparseExpr((Expr *) node, &inner_context);
 	}
 
 	/* Don't generate bad syntax if no expressions */
@@ -2394,7 +2431,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		/* Append join clause; (TRUE) if no join clause */
 		if (fpinfo->joinclauses)
 		{
-			deparse_expr_cxt context;
+			deparse_expr_cxt context = {0};
 
 			context.buf = buf;
 			context.foreignrel = foreignrel;
@@ -2856,7 +2893,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 					   List *returningList,
 					   List **retrieved_attrs)
 {
-	deparse_expr_cxt context;
+	deparse_expr_cxt context = {0};
 	int			nestlevel;
 	bool		first;
 	RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
@@ -3007,7 +3044,7 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 					   List *returningList,
 					   List **retrieved_attrs)
 {
-	deparse_expr_cxt context;
+	deparse_expr_cxt context = {0};
 
 	/* Set up context struct for recursion */
 	context.root = root;
@@ -3274,7 +3311,10 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		 * If it's a column of a foreign table, and it has the column_name FDW
 		 * option, use that value.
 		 */
-		options = GetForeignColumnOptions(rte->relid, varattno);
+		options = NIL;
+		if (OidIsValid(rte->relid))
+			options = GetForeignColumnOptions(rte->relid, varattno);
+
 		foreach(lc, options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc);
@@ -3291,7 +3331,12 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		 * FDW option, use attribute name.
 		 */
 		if (colname == NULL)
-			colname = get_attname(rte->relid, varattno, false);
+		{
+			if (OidIsValid(rte->relid))
+				colname = get_attname(rte->relid, varattno, false);
+			else
+				colname = get_rte_attribute_name(rte, varattno);
+		}
 
 		if (qualify_col)
 			ADD_REL_QUALIFIER(buf, varno);
@@ -3305,23 +3350,53 @@ deparse_subquery_column_ref(StringInfo buf, int varno, int varattno,
 						  RangeTblEntry *rte, bool qualify_col)
 {
 	TargetEntry *tle;
+	TargetEntry *raw_tle;
 	ListCell   *lc;
 	RangeTblEntry *base_rte = NULL;
 	Var		   *inner_var;
 	RangeTblEntry *inner_rte;
 	char	   *colname;
 
-	tle = get_tle_by_resno(rte->subquery->targetList, varattno);
+	tle = get_nth_visible_tle(rte->subquery->targetList, varattno);
+	raw_tle = get_tle_by_resno(rte->subquery->targetList, varattno);
+	if (tle == NULL && raw_tle != NULL)
+	{
+		Node	   *reference_expr = strip_implicit_coercions((Node *) raw_tle->expr);
+
+		foreach(lc, rte->subquery->targetList)
+		{
+			TargetEntry *candidate = lfirst_node(TargetEntry, lc);
+			Node	   *candidate_expr;
+
+			if (candidate->resjunk)
+				continue;
+
+			candidate_expr = strip_implicit_coercions((Node *) candidate->expr);
+			if (equal(candidate_expr, reference_expr))
+			{
+				tle = candidate;
+				break;
+			}
+		}
+
+		if (tle == NULL && !raw_tle->resjunk)
+			tle = raw_tle;
+	}
 	if (tle == NULL && !OidIsValid(rte->relid))
 	{
 		foreach(lc, rte->subquery->targetList)
 		{
 			TargetEntry *candidate = lfirst_node(TargetEntry, lc);
+			Node	   *candidate_expr;
 
-			if (candidate->resjunk || !IsA(candidate->expr, Var))
+			if (candidate->resjunk)
 				continue;
 
-			inner_var = (Var *) candidate->expr;
+			candidate_expr = strip_implicit_coercions((Node *) candidate->expr);
+			if (!IsA(candidate_expr, Var))
+				continue;
+
+			inner_var = (Var *) candidate_expr;
 			if (inner_var->varattno == varattno)
 			{
 				tle = candidate;
@@ -3661,7 +3736,63 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 
 	if (node->varno == context->scanrel->relid)
 	{
-		tle = get_tle_by_resno(subquery->targetList, node->varattno);
+		Node	   *reference_expr = NULL;
+
+		tle = get_nth_visible_tle(subquery->targetList, node->varattno);
+		if (tle != NULL)
+		{
+			reference_expr = (Node *) tle->expr;
+#if PG_VERSION_NUM >= 180000
+			reference_expr = flatten_group_exprs(context->root, subquery,
+								  reference_expr);
+#endif
+			reference_expr = strip_implicit_coercions(reference_expr);
+
+			if (!tle->resjunk)
+				reference_expr = NULL;
+			else
+				tle = NULL;
+		}
+
+		if (tle == NULL)
+		{
+			ListCell   *lc;
+
+			foreach(lc, subquery->targetList)
+			{
+				TargetEntry *candidate = lfirst_node(TargetEntry, lc);
+				Node	   *candidate_expr;
+
+				if (candidate->resjunk)
+					continue;
+
+				candidate_expr = (Node *) candidate->expr;
+#if PG_VERSION_NUM >= 180000
+				candidate_expr = flatten_group_exprs(context->root, subquery,
+									 candidate_expr);
+#endif
+				candidate_expr = strip_implicit_coercions(candidate_expr);
+				if (reference_expr != NULL)
+				{
+					if (equal(candidate_expr, reference_expr))
+					{
+						tle = candidate;
+						break;
+					}
+					continue;
+				}
+
+				if (!IsA(candidate_expr, Var))
+					continue;
+
+				inner_var = (Var *) candidate_expr;
+				if (inner_var->varattno == node->varattno)
+				{
+					tle = candidate;
+					break;
+				}
+			}
+		}
 		if (tle == NULL || tle->resjunk)
 			return false;
 
@@ -3695,7 +3826,7 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 #if PG_VERSION_NUM >= 180000
 	if (inner_rte->rtekind == RTE_GROUP)
 	{
-		tle = get_tle_by_resno(subquery->targetList, node->varattno);
+		tle = get_nth_visible_tle(subquery->targetList, node->varattno);
 		if (tle != NULL && !tle->resjunk && tle->resname != NULL)
 		{
 			appendStringInfoString(context->buf,

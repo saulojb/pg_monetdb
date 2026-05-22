@@ -62,3 +62,10 @@ FROM retidos;
 - Status: aberto
 - Sintoma: `make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config` pode falhar com `Operation not permitted` ao gerar `monetdb_fdw.bc`.
 - Impacto: atrapalha o ciclo de rebuild/validacao e mascara se o binario instalado corresponde ao codigo atual.
+
+### 6. Avaliar reescrita de `FILTER` para `CASE WHEN`
+
+- Status: aberto
+- Pergunta a responder: para a variante `SUM(receita) FILTER (WHERE mes = 1) AS jan`, podemos deparsing/rewrite para `SUM(CASE WHEN mes = 1 THEN receita ELSE 0 END) AS jan`?
+- Contexto: o shape mensal com grouped bridge ja foi validado no formato atual, mas vale confirmar se a reescrita para `CASE WHEN` ajuda compatibilidade de pushdown, simplifica o SQL remoto ou evita novos cantos de planner/deparser.
+- Guard-rail: qualquer experimento precisa preservar os casos ja validados, em especial o pivot mensal e `sql/grouped_bridge_window_manual.sql`.
