@@ -160,6 +160,7 @@ static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context);
+static void deparseMinMaxExpr(MinMaxExpr *node, deparse_expr_cxt *context);
 static void deparseArrayExpr(ArrayExpr *node, deparse_expr_cxt *context);
 static void printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
 							 deparse_expr_cxt *context);
@@ -889,6 +890,37 @@ foreign_expr_walker(Node *node,
 				 * the THEN and ELSE subexpressions.
 				 */
 				collation = ce->casecollid;
+				if (collation == InvalidOid)
+					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 collation == inner_cxt.collation)
+					state = FDW_COLLATE_SAFE;
+				else if (collation == DEFAULT_COLLATION_OID)
+					state = FDW_COLLATE_NONE;
+				else
+					state = FDW_COLLATE_UNSAFE;
+			}
+			break;
+		case T_MinMaxExpr:
+			{
+				MinMaxExpr *mm = (MinMaxExpr *) node;
+
+				if (!foreign_expr_walker((Node *) mm->args,
+									 glob_cxt, &inner_cxt, case_arg_cxt))
+					return false;
+
+				if (mm->inputcollid == InvalidOid)
+					 /* OK, inputs are all noncollatable */ ;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 mm->inputcollid == inner_cxt.collation)
+					 /* OK, collation derived from a foreign Var */ ;
+				else if (inner_cxt.state == FDW_COLLATE_NONE &&
+						 mm->inputcollid == DEFAULT_COLLATION_OID)
+					 /* OK, inputs are constants/params with default collation */ ;
+				else
+					return false;
+
+				collation = mm->minmaxcollid;
 				if (collation == InvalidOid)
 					state = FDW_COLLATE_NONE;
 				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
@@ -3434,6 +3466,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_CaseExpr:
 			deparseCaseExpr((CaseExpr *) node, context);
 			break;
+		case T_MinMaxExpr:
+			deparseMinMaxExpr((MinMaxExpr *) node, context);
+			break;
 		case T_ArrayExpr:
 			deparseArrayExpr((ArrayExpr *) node, context);
 			break;
@@ -4385,6 +4420,34 @@ deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context)
 
 	/* append END */
 	appendStringInfoString(buf, " END)");
+}
+
+/*
+ * Deparse LEAST(...) / GREATEST(...).
+ */
+static void
+deparseMinMaxExpr(MinMaxExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	ListCell   *lc;
+	const char *funcname;
+
+	if (node->op == IS_GREATEST)
+		funcname = "GREATEST";
+	else
+	{
+		Assert(node->op == IS_LEAST);
+		funcname = "LEAST";
+	}
+
+	appendStringInfo(buf, "%s(", funcname);
+	foreach(lc, node->args)
+	{
+		if (lc != list_head(node->args))
+			appendStringInfoString(buf, ", ");
+		deparseExpr((Expr *) lfirst(lc), context);
+	}
+	appendStringInfoChar(buf, ')');
 }
 
 /*
