@@ -160,6 +160,7 @@ static void deparseRelabelType(RelabelType *node, deparse_expr_cxt *context);
 static void deparseBoolExpr(BoolExpr *node, deparse_expr_cxt *context);
 static void deparseNullTest(NullTest *node, deparse_expr_cxt *context);
 static void deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context);
+static void deparseNullIfExpr(NullIfExpr *node, deparse_expr_cxt *context);
 static void deparseCoalesceExpr(CoalesceExpr *node, deparse_expr_cxt *context);
 static void deparseMinMaxExpr(MinMaxExpr *node, deparse_expr_cxt *context);
 static void deparseArrayExpr(ArrayExpr *node, deparse_expr_cxt *context);
@@ -666,6 +667,7 @@ foreign_expr_walker(Node *node,
 			break;
 		case T_OpExpr:
 		case T_DistinctExpr:	/* struct-equivalent to OpExpr */
+		case T_NullIfExpr:	/* struct-equivalent to OpExpr */
 			{
 				OpExpr	   *oe = (OpExpr *) node;
 
@@ -3510,6 +3512,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_CaseExpr:
 			deparseCaseExpr((CaseExpr *) node, context);
 			break;
+		case T_NullIfExpr:
+			deparseNullIfExpr((NullIfExpr *) node, context);
+			break;
 		case T_CoalesceExpr:
 			deparseCoalesceExpr((CoalesceExpr *) node, context);
 			break;
@@ -4467,6 +4472,27 @@ deparseCaseExpr(CaseExpr *node, deparse_expr_cxt *context)
 
 	/* append END */
 	appendStringInfoString(buf, " END)");
+}
+
+/*
+ * Deparse NULLIF(a, b).
+ */
+static void
+deparseNullIfExpr(NullIfExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	Expr	   *left;
+	Expr	   *right;
+
+	Assert(list_length(node->args) == 2);
+	left = linitial(node->args);
+	right = lsecond(node->args);
+
+	appendStringInfoString(buf, "NULLIF(");
+	deparseExpr(left, context);
+	appendStringInfoString(buf, ", ");
+	deparseExpr(right, context);
+	appendStringInfoChar(buf, ')');
 }
 
 /*
