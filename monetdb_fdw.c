@@ -2137,6 +2137,7 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 					   List *scan_clauses,
 					   Plan *outer_plan)
 {
+	Query	   *parse = root->parse;
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) foreignrel->fdw_private;
 	Index		scan_relid;
 	bool		grouped_bridge = IS_SIMPLE_REL(foreignrel) &&
@@ -2170,6 +2171,28 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 									FdwPathPrivateHasLimit));
 #endif
 	}
+
+	/*
+	 * Some top-level ordered foreign paths reach GetForeignPlan without a
+	 * UPPERREL_FINAL callback, so opportunistically append LIMIT/OFFSET to the
+	 * remote SQL when the chosen foreign path already satisfies the query order.
+	 * A local Limit node may still remain above the scan, but becomes a safe
+	 * redundant check rather than a performance barrier.
+	 */
+	if (!has_limit &&
+		parse->commandType == CMD_SELECT &&
+		!parse->rowMarks &&
+		!parse->hasTargetSRFs &&
+		parse->limitOption != LIMIT_OPTION_WITH_TIES &&
+		fpinfo != NULL && fpinfo->local_conds == NIL &&
+		outer_plan == NULL &&
+		foreignrel->relids != NULL && root->all_baserels != NULL &&
+		bms_equal(foreignrel->relids, root->all_baserels) &&
+		(root->sort_pathkeys == NIL ||
+		 pathkeys_contained_in(root->sort_pathkeys, best_path->path.pathkeys)) &&
+		is_foreign_expr(root, foreignrel, (Expr *) parse->limitOffset) &&
+		is_foreign_expr(root, foreignrel, (Expr *) parse->limitCount))
+		has_limit = true;
 
 	if (IS_SIMPLE_REL(foreignrel))
 	{
@@ -6050,7 +6073,9 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (!is_foreign_expr(root, input_rel, (Expr *) parse->limitOffset) ||
 		!is_foreign_expr(root, input_rel, (Expr *) parse->limitCount))
+	{
 		return;
+	}
 
 	/* Safe to push down */
 	fpinfo->pushdown_safe = true;
@@ -6100,7 +6125,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * plan (if any), which makes the EXPLAIN output look cleaner
 	 */
 	final_path = create_foreign_upper_path(root,
-										   input_rel,
+								   input_rel,
 										   root->upper_targets[UPPERREL_FINAL],
 										   rows,
 #if PG_VERSION_NUM >= 180000

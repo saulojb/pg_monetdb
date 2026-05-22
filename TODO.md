@@ -2,6 +2,11 @@
 
 Atualizado em 2026-05-22.
 
+## Notas recentes
+
+- `ORDER BY ... LIMIT` do caso de outliers em PG19 agora sai com `LIMIT` no SQL remoto quando o planner escolhe um `ForeignPath` ordenado de topo sem reutilizar o path de `UPPERREL_FINAL`.
+- Estado validado: `EXPLAIN (VERBOSE)` e `EXPLAIN (ANALYZE, VERBOSE)` do shape com `estatisticas_parte`/`outliers` mostram `LIMIT` remoto e `Foreign Scan actual rows=5`.
+
 ## Pendencias de planner/deparser
 
 ### 1. Revisar lifecycle de conexao em `monetdb_execute`
