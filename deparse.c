@@ -92,6 +92,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	bool		grouped_subquery_inner;
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -1523,15 +1524,64 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 	 * Construct SELECT list
 	 */
 	appendStringInfoString(buf, "SELECT ");
+	if (retrieved_attrs)
+		*retrieved_attrs = NIL;
 
 	if (is_subquery || is_grouped_subquery_bridge(foreignrel))
 	{
+		ListCell   *lc;
+
 		/*
 		 * For a relation that is deparsed as a subquery, emit expressions
 		 * specified in the relation's reltarget.  Note that since this is for
 		 * the subquery, no need to care about *retrieved_attrs.
 		 */
 		deparseSubqueryTargetList(context);
+
+		if (!is_subquery && is_grouped_subquery_bridge(foreignrel) &&
+			retrieved_attrs != NULL)
+		{
+			RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+			ListCell   *tlc;
+
+			Assert(rte->rtekind == RTE_SUBQUERY);
+			Assert(rte->subquery != NULL);
+
+			foreach(lc, rte->subquery->targetList)
+			{
+				TargetEntry *tle = lfirst_node(TargetEntry, lc);
+				TargetEntry *matching_tle = NULL;
+
+				if (tle->resjunk)
+					continue;
+
+				foreach(tlc, tlist)
+				{
+					TargetEntry *scan_tle = lfirst_node(TargetEntry, tlc);
+					Var	   *var;
+
+					if (scan_tle->resjunk || !IsA(scan_tle->expr, Var))
+						continue;
+
+					var = (Var *) scan_tle->expr;
+					if (var->varlevelsup == 0 &&
+						var->varno == foreignrel->relid &&
+						var->varattno == tle->resno)
+					{
+						matching_tle = scan_tle;
+						break;
+					}
+				}
+
+				if (matching_tle == NULL)
+					elog(ERROR,
+						 "could not map grouped bridge output column %d into fdw_scan_tlist",
+						 tle->resno);
+
+				*retrieved_attrs = lappend_int(*retrieved_attrs,
+								   matching_tle->resno);
+			}
+		}
 	}
 	else if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 	{
@@ -2378,9 +2428,12 @@ deparse_grouped_subquery_from_node(StringInfo buf, Query *subquery, Node *node,
 		appendStringInfoString(buf, " ON ");
 		if (joinexpr->quals != NULL)
 		{
+			deparse_expr_cxt inner_context = *context;
+
+			inner_context.grouped_subquery_inner = true;
 			appendStringInfoChar(buf, '(');
 			appendConditions(make_ands_implicit((Expr *) joinexpr->quals),
-						 context);
+						 &inner_context);
 			appendStringInfoChar(buf, ')');
 		}
 		else
@@ -3499,6 +3552,25 @@ deparse_grouped_subquery_bridge_var(Var *node, deparse_expr_cxt *context)
 		return false;
 
 	subquery = bridge_rte->subquery;
+
+	if (context->grouped_subquery_inner)
+	{
+		if (node->varno < 1 || node->varno > list_length(subquery->rtable))
+			return false;
+
+		inner_rte = rt_fetch(node->varno, subquery->rtable);
+
+#if PG_VERSION_NUM >= 180000
+		if (inner_rte->rtekind == RTE_GROUP)
+			return false;
+#endif
+		if (inner_rte->rtekind != RTE_RELATION)
+			return false;
+
+		deparseColumnRef(context->buf, node->varno, node->varattno,
+					 inner_rte, true);
+		return true;
+	}
 
 	if (node->varno == context->scanrel->relid)
 	{
@@ -4816,6 +4888,19 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 
 		if (matching_tle)
 			appendStringInfo(buf, "%d", matching_tle->resno);
+		else if (is_grouped_subquery_bridge(context->scanrel) &&
+				 !has_final_sort &&
+				 IsA(em_expr, Var))
+		{
+			Var	   *sortvar = (Var *) em_expr;
+
+			if (sortvar->varlevelsup == 0 &&
+				sortvar->varno == context->scanrel->relid &&
+				sortvar->varattno > 0)
+				appendStringInfo(buf, "%d", sortvar->varattno);
+			else
+				deparseExpr(em_expr, context);
+		}
 		else
 			deparseExpr(em_expr, context);
 

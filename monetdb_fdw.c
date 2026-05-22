@@ -128,6 +128,12 @@ static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   RangeTblEntry *rte,
 									   Oid relid);
 static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
+static void MonetDB_GetForeignRelSize(PlannerInfo *root,
+					   RelOptInfo *baserel,
+					   Oid foreigntableid);
+static void MonetDB_GetForeignPaths(PlannerInfo *root,
+					 RelOptInfo *baserel,
+					 Oid foreigntableid);
 static void MonetDB_GetForeignJoinPaths(PlannerInfo *root,
 						   RelOptInfo *joinrel,
 						   RelOptInfo *outerrel,
@@ -369,10 +375,27 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					Index rti, RangeTblEntry *rte)
 {
 	Oid			derived_relid = InvalidOid;
+	bool			grouped_bridge = false;
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
 		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
+	{
 		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, rte, derived_relid);
+		grouped_bridge = true;
+	}
+	else if (pg_monetdb_is_grouped_bridge_rel(rel))
+		grouped_bridge = true;
+
+	/*
+	 * Core FDW callbacks are not invoked for a plain RTE_SUBQUERY baserel, so
+	 * grouped subquery bridges need their foreign size/path builders kicked
+	 * manually from the rel-pathlist hook.
+	 */
+	if (grouped_bridge && derived_relid != InvalidOid)
+	{
+		MonetDB_GetForeignRelSize(root, rel, derived_relid);
+		MonetDB_GetForeignPaths(root, rel, derived_relid);
+	}
 
 	if (pg_monetdb_enable_planner_hook_debug &&
 		root != NULL && root->parse != NULL &&
@@ -910,6 +933,12 @@ PG_FUNCTION_INFO_V1(monetdb_execute);
  * FDW callback routines
  */
 static void MonetDB_GetForeignRelSize(PlannerInfo *root,
+					   RelOptInfo *baserel,
+					   Oid foreigntableid);
+static void MonetDB_GetForeignPaths(PlannerInfo *root,
+					 RelOptInfo *baserel,
+					 Oid foreigntableid);
+static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 									  RelOptInfo *baserel,
 									  Oid foreigntableid);
 static void MonetDB_GetForeignPaths(PlannerInfo *root,
@@ -1179,21 +1208,44 @@ MonetDB_GetForeignRelSize(PlannerInfo *root,
 						  Oid foreigntableid)
 {
 	MonetdbFdwRelationInfo *fpinfo;
+	bool		grouped_bridge;
 	ListCell   *lc;
+
+	grouped_bridge = pg_monetdb_is_grouped_bridge_rel(baserel);
+	fpinfo = (MonetdbFdwRelationInfo *) baserel->fdw_private;
+
+	if (pg_monetdb_enable_planner_hook_debug && grouped_bridge)
+		elog(DEBUG1,
+			 "pg_monetdb rel size: grouped bridge relid=%u relids=%s existing_stage=%d existing_name=%s",
+			 baserel->relid,
+			 baserel->relids != NULL ? bmsToString(baserel->relids) : "<null>",
+			 fpinfo != NULL ? fpinfo->stage : -1,
+			 fpinfo != NULL && fpinfo->relation_name != NULL ? fpinfo->relation_name : "<none>");
 
 	/*
 	 * We use MonetdbFdwRelationInfo to pass various information to subsequent
 	 * functions.
 	 */
-	fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
-	baserel->fdw_private = (void *) fpinfo;
+	if (fpinfo == NULL)
+	{
+		fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
+		baserel->fdw_private = (void *) fpinfo;
+	}
 
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
 
 	/* Look up foreign-table catalog info. */
-	fpinfo->table = GetForeignTable(foreigntableid);
-	fpinfo->server = GetForeignServer(fpinfo->table->serverid);
+	if (grouped_bridge)
+	{
+		Assert(fpinfo->table != NULL);
+		Assert(fpinfo->server != NULL);
+	}
+	else
+	{
+		fpinfo->table = GetForeignTable(foreigntableid);
+		fpinfo->server = GetForeignServer(fpinfo->table->serverid);
+	}
 
 	/*
 	 * Extract user-settable option values.  Note that per-table settings of
@@ -1327,14 +1379,27 @@ MonetDB_GetForeignRelSize(PlannerInfo *root,
 	 * table RTE.  (If this query gets EXPLAIN'd, we'll convert that to a
 	 * human-readable string at that time.)
 	 */
-	fpinfo->relation_name = psprintf("%u", baserel->relid);
+	if (!grouped_bridge)
+		fpinfo->relation_name = psprintf("%u", baserel->relid);
 
 	/* No outer and inner relations. */
 	fpinfo->make_outerrel_subquery = false;
 	fpinfo->make_innerrel_subquery = false;
 	fpinfo->lower_subquery_rels = NULL;
 	/* Set the relation index. */
-	fpinfo->relation_index = baserel->relid;
+	if (!grouped_bridge)
+		fpinfo->relation_index = baserel->relid;
+
+	if (pg_monetdb_enable_planner_hook_debug && grouped_bridge)
+		elog(DEBUG1,
+			 "pg_monetdb rel size: grouped bridge final rows=%.0f width=%d startup=%.2f total=%.2f remote_conds=%d local_conds=%d stage=%d",
+			 fpinfo->rows,
+			 fpinfo->width,
+			 fpinfo->startup_cost,
+			 fpinfo->total_cost,
+			 list_length(fpinfo->remote_conds),
+			 list_length(fpinfo->local_conds),
+			 fpinfo->stage);
 }
 
 /*
@@ -1569,6 +1634,17 @@ MonetDB_GetForeignPaths(PlannerInfo *root,
 	ForeignPath *path;
 	List	   *ppi_list;
 	ListCell   *lc;
+	bool		grouped_bridge = pg_monetdb_is_grouped_bridge_rel(baserel);
+
+	if (pg_monetdb_enable_planner_hook_debug && grouped_bridge)
+		elog(DEBUG1,
+			 "pg_monetdb foreign paths: grouped bridge relid=%u rows=%.0f startup=%.2f total=%.2f pathkeys_safe=%s stage=%d",
+			 baserel->relid,
+			 fpinfo != NULL ? fpinfo->rows : -1,
+			 fpinfo != NULL ? fpinfo->startup_cost : -1,
+			 fpinfo != NULL ? fpinfo->total_cost : -1,
+			 fpinfo != NULL && fpinfo->qp_is_pushdown_safe ? "true" : "false",
+			 fpinfo != NULL ? fpinfo->stage : -1);
 
 	/*
 	 * Create simplest ForeignScan path node and add it to baserel.  This path
@@ -1898,6 +1974,8 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 {
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) foreignrel->fdw_private;
 	Index		scan_relid;
+	bool		grouped_bridge = IS_SIMPLE_REL(foreignrel) &&
+		pg_monetdb_is_grouped_bridge_rel(foreignrel);
 	List	   *fdw_private;
 	List	   *remote_exprs = NIL;
 	List	   *local_exprs = NIL;
@@ -1933,7 +2011,10 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 		/*
 		 * For base relations, set scan_relid as the relid of the relation.
 		 */
-		scan_relid = foreignrel->relid;
+		scan_relid = grouped_bridge ? 0 : foreignrel->relid;
+
+		if (grouped_bridge)
+			fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
 
 		/*
 		 * In a base-relation scan, we must apply the given scan_clauses.
@@ -1976,7 +2057,8 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 		 * For a base-relation scan, we have to support EPQ recheck, which
 		 * should recheck all the remote quals.
 		 */
-		fdw_recheck_quals = remote_exprs;
+		if (!grouped_bridge)
+			fdw_recheck_quals = remote_exprs;
 	}
 	else
 	{
