@@ -139,6 +139,16 @@ IMPORT FOREIGN SCHEMA "zm" limit to (emp) from server foreign_server into public
 
 Test case please reference [type\_support.sql](./sql/type_support.sql)
 
+#### Manual Validation
+
+For planner validation against an existing PostgreSQL database with imported TPC-H foreign tables in schema `monet`, see [materialized_cte_manual.sql](./sql/materialized_cte_manual.sql).
+
+Typical invocation:
+
+```sh
+sudo -n -u postgres psql -X -p 5433 -d monet_test -f sql/materialized_cte_manual.sql
+```
+
 #### Limits
 
 Primary Key is required for DELETE and UPDATE operations.
