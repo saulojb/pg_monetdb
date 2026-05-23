@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	162.490	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q02	OK	19235.930	FS+LOCAL_SORT	full all.sql run on PostgreSQL 18; top-N sort/limit wrapper above remote Foreign Scan
+Q03	OK	22.368	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q04	OK	109.007	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 18; EXISTS pushed remote, local aggregate/sort remains
+Q05	OK	30.458	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q06	OK	13.905	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q07	OK	57.515	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 18; remote join/filter with local aggregate/sort on EXTRACT expression
+Q08	OK	39.640	FS+LOCAL_SORT	matches baseline shape; local sort above remote Foreign Scan
+Q09	OK	117.891	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q10	OK	279.087	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q11	OK	10.930	FS+INITPLAN	validated isolated after nested scalar aggregate pushdown fix; remote Foreign Scan plus remote InitPlan restored
+Q12	OK	67.382	FS+LOCAL_AGG+LOCAL_SORT	baseline had FS+LOCAL_AGG; PostgreSQL 18 keeps a local sort wrapper
+Q13	OK	232.228	FS+LOCAL_AGG+LOCAL_SORT	validated isolated after grouped bridge support for LEFT JOIN subqueries; remote grouped scan feeds local aggregate/sort
+Q14	OK	6.893	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q15	OK	52.713	MIXED	validated isolated after enabling grouped bridge for view-expanded grouped subqueries and fixing temporal deparse for remote view pushdown
+Q16	OK	108.696	FS	matches baseline shape; NOT IN subquery pushdown active
+Q17	OK	6.023	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q18	ISSUE	2399.404	FS	validated isolated twice; grouped-subquery join pushdown remains active, but runtime is still far above PG18 baseline despite full remote plan
+Q19	OK	43.832	FS	full all.sql run on PostgreSQL 18; single Foreign Scan
+Q20	OK	336.690	FS+LOCAL_SORT	matches baseline shape; remote query with local top sort
+Q21	OK	92.855	FS+LOCAL_LIMIT	remote JOIN_ANTI rewrite still active; PostgreSQL 18 keeps a local Limit wrapper
+Q22	OK	37.688	FS+INITPLAN+LOCAL_AGG+LOCAL_SORT+LOCAL_LIMIT	remote InitPlan and remote NOT EXISTS feed local aggregate; PostgreSQL 18 also keeps local sort/limit wrapper

@@ -47,6 +47,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/typcache.h"
 #include "commands/tablecmds.h"
 
@@ -3869,6 +3870,24 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 
 	switch (node->consttype)
 	{
+		case DATEOID:
+			appendStringInfoString(buf, "DATE ");
+			deparseStringLiteral(buf, extval);
+			break;
+		case INTERVALOID:
+			{
+				Interval   *interval = DatumGetIntervalP(node->constvalue);
+
+				if (!INTERVAL_NOT_FINITE(interval) &&
+					interval->day == 0 && interval->time == 0)
+					appendStringInfo(buf, "INTERVAL '%d' MONTH", interval->month);
+				else if (!INTERVAL_NOT_FINITE(interval) &&
+						 interval->month == 0 && interval->time == 0)
+					appendStringInfo(buf, "INTERVAL '%d' DAY", interval->day);
+				else
+					deparseStringLiteral(buf, extval);
+			}
+			break;
 		case INT2OID:
 		case INT4OID:
 		case INT8OID:
@@ -4001,12 +4020,29 @@ static void
 deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
+	HeapTuple	proctup;
+	Form_pg_proc procform;
 	bool		use_variadic;
 	bool		first;
 	ListCell   *arg;
 
 	if (deparseExtractFuncExpr(node, context))
 		return;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", node->funcid);
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+	if (list_length(node->args) == 1 && node->funcresulttype == DATEOID &&
+		strcmp(NameStr(procform->proname), "date") == 0)
+	{
+		appendStringInfoString(buf, "CAST(");
+		deparseExpr((Expr *) linitial(node->args), context);
+		appendStringInfoString(buf, " AS date)");
+		ReleaseSysCache(proctup);
+		return;
+	}
 
 	/*
 	 * If the function call came from an implicit coercion, then just show the
@@ -4015,6 +4051,7 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 	if (node->funcformat == COERCE_IMPLICIT_CAST)
 	{
 		deparseExpr((Expr *) linitial(node->args), context);
+		ReleaseSysCache(proctup);
 		return;
 	}
 
@@ -4033,6 +4070,7 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 		deparseExpr((Expr *) linitial(node->args), context);
 		appendStringInfo(buf, "::%s",
 						 deparse_type_name(rettype, coercedTypmod));
+		ReleaseSysCache(proctup);
 		return;
 	}
 
@@ -4057,6 +4095,8 @@ deparseFuncExpr(FuncExpr *node, deparse_expr_cxt *context)
 		first = false;
 	}
 	appendStringInfoChar(buf, ')');
+
+	ReleaseSysCache(proctup);
 }
 
 static bool

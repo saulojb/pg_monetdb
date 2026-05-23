@@ -126,6 +126,8 @@ static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
 static bool pg_monetdb_fromnode_has_join(Node *node);
 static bool pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root);
 static bool pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root);
+static bool pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
+									 RelOptInfo *input_rel);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   Index rti,
 									   RangeTblEntry *rte,
@@ -441,10 +443,12 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 
 	/*
 	 * Derived grouped subqueries from the query text have no relid.  View
-	 * expansion also produces RTE_SUBQUERY, but those carry the view relid and
-	 * need different semantics from the Q18 bridge path.
+	 * expansion also produces RTE_SUBQUERY, and simple grouped foreign views
+	 * can use the same grouped-bridge path safely.  Keep rejecting other
+	 * relid-carrying expansion cases.
 	 */
-	if (OidIsValid(rte->relid))
+	if (OidIsValid(rte->relid) &&
+		get_rel_relkind(rte->relid) != RELKIND_VIEW)
 		return false;
 
 	subquery = rte->subquery;
@@ -500,7 +504,8 @@ pg_monetdb_grouped_subquery_find_anchor(Query *subquery, Node *fromnode,
 		Oid			anchor_relid = relid_out != NULL ? *relid_out : InvalidOid;
 		Oid			anchor_serverid = serverid_out != NULL ? *serverid_out : InvalidOid;
 
-		if (joinexpr->jointype != JOIN_INNER)
+		if (joinexpr->jointype != JOIN_INNER &&
+			joinexpr->jointype != JOIN_LEFT)
 			return false;
 
 		if (!pg_monetdb_grouped_subquery_find_anchor(subquery, joinexpr->larg,
@@ -644,6 +649,27 @@ pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root)
 	}
 
 	return matches == 1;
+}
+
+static bool
+pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
+									 RelOptInfo *input_rel)
+{
+	if (root == NULL || root->parent_root == NULL || root->parse == NULL ||
+		input_rel == NULL)
+		return false;
+
+	if (pg_monetdb_is_grouped_bridge_rel(input_rel))
+		return false;
+
+	if (!root->parse->hasAggs || root->parse->groupClause != NIL ||
+		root->parse->groupingSets != NIL || root->hasHavingQual)
+		return false;
+
+	if (root->parse->setOperations != NULL || root->parse->hasWindowFuncs)
+		return false;
+
+	return true;
 }
 
 static List *
@@ -5520,6 +5546,7 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 							 void *extra)
 {
 	MonetdbFdwRelationInfo *fpinfo;
+	bool		single_consumer_nested = false;
 
 	/*
 	 * If input rel is not safe to pushdown, then simply return as we cannot
@@ -5535,6 +5562,9 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		 stage != UPPERREL_FINAL) ||
 		output_rel->fdw_private)
 		return;
+
+	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
+		single_consumer_nested = pg_monetdb_is_single_consumer_nested_query(root);
 
 	/*
 	 * A plain aggregate on top of a grouped-bridge subquery still needs a
@@ -5552,9 +5582,15 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	 * as a local subplan boundary.  Pushing GROUP_AGG here can leave planner
 	 * bookkeeping expecting subplan target entries that the foreign path does
 	 * not expose correctly for materialized consumers.
+	 *
+	 * A plain scalar aggregate SubPlan is a narrower case: there is no grouped
+	 * bridge output to preserve, and keeping GROUP_AGG local prevents the inner
+	 * plan from becoming the remote ForeignScan shape that SubPlan inlining and
+	 * remote InitPlan pushdown expect later.
 	 */
 	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL &&
-		!pg_monetdb_is_single_consumer_nested_query(root))
+		!single_consumer_nested &&
+		!pg_monetdb_is_simple_nested_aggregate_subquery(root, input_rel))
 		return;
 
 	fpinfo = (MonetdbFdwRelationInfo *) palloc0(sizeof(MonetdbFdwRelationInfo));
@@ -7099,7 +7135,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	 */
 	if (root->parent_root != NULL &&
 		(root->parse->hasAggs || root->parse->groupClause != NIL) &&
-		!pg_monetdb_is_single_consumer_nested_query(root))
+		!pg_monetdb_is_single_consumer_nested_query(root) &&
+		!pg_monetdb_is_simple_nested_aggregate_subquery(root, joinrel))
 		return false;
 
 	/*
