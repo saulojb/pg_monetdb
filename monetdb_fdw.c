@@ -35,6 +35,7 @@
 #include "foreign/fdwapi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
@@ -76,6 +77,7 @@ static create_upper_paths_hook_type next_create_upper_paths_hook = NULL;
 static set_rel_pathlist_hook_type next_set_rel_pathlist_hook = NULL;
 static set_join_pathlist_hook_type next_set_join_pathlist_hook = NULL;
 static bool pg_monetdb_enable_planner_hook_debug = false;
+static bool pg_monetdb_enable_exec_timing_debug = false;
 static int pg_monetdb_trace_active_depth = 0;
 
 typedef struct PgMonetdbPlannerTraceContext
@@ -151,6 +153,7 @@ static void pg_monetdb_log_query_shape(Query *query, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
 static const char *pg_monetdb_upper_stage_name(UpperRelationKind stage);
+static double pg_monetdb_instr_time_ms(instr_time *start_time);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
@@ -248,6 +251,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("pg_monetdb.enable_exec_timing_debug",
+							 "Emit DEBUG1 timing traces for MonetDB fetch and tuple conversion.",
+							 NULL,
+							 &pg_monetdb_enable_exec_timing_debug,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	EmitWarningsOnPlaceholders("pg_monetdb");
 
 	next_planner_hook = planner_hook;
@@ -271,6 +285,16 @@ _PG_fini(void)
 		set_rel_pathlist_hook = next_set_rel_pathlist_hook;
 	if (set_join_pathlist_hook == pg_monetdb_set_join_pathlist)
 		set_join_pathlist_hook = next_set_join_pathlist_hook;
+}
+
+static double
+pg_monetdb_instr_time_ms(instr_time *start_time)
+{
+	instr_time	elapsed;
+
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, *start_time);
+	return INSTR_TIME_GET_MILLISEC(elapsed);
 }
 
 static PlannedStmt *
@@ -963,6 +987,13 @@ typedef struct MonetdbFdwScanState
 	/* working memory contexts */
 	MemoryContext batch_cxt;	/* context holding current batch of tuples */
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
+
+	/* execution timing diagnostics */
+	double		query_ms;		/* time spent in initial mapi_query */
+	double		fetch_ms;		/* time spent converting batches */
+	double		tuple_conv_ms;	/* subset of fetch_ms in tuple conversion */
+	uint64		fetched_rows;	/* number of rows materialized locally */
+	uint64		fetch_batches;	/* number of local conversion batches */
 
 	int			fetch_size;		/* number of tuples per fetch */
 } MonetdbFdwScanState;
@@ -2608,7 +2639,16 @@ MonetDB_IterateForeignScan(ForeignScanState *node)
 			sql = fsstate->query;
 
 		/* Submit a query and wait for the result. */
-		fsstate->hdl = mapi_query(fsstate->conn, sql);
+		if (pg_monetdb_enable_exec_timing_debug)
+		{
+			instr_time	query_start;
+
+			INSTR_TIME_SET_CURRENT(query_start);
+			fsstate->hdl = mapi_query(fsstate->conn, sql);
+			fsstate->query_ms += pg_monetdb_instr_time_ms(&query_start);
+		}
+		else
+			fsstate->hdl = mapi_query(fsstate->conn, sql);
 		if (fsstate->hdl == NULL || mapi_error(fsstate->conn) != MOK)
 		{
 			if (mapi_error(fsstate->conn))
@@ -2701,6 +2741,18 @@ MonetDB_EndForeignScan(ForeignScanState *node)
 	/* Release remote connection */
 	ReleaseConnection(fsstate->conn);
 	fsstate->conn = NULL;
+
+	if (pg_monetdb_enable_exec_timing_debug)
+		elog(DEBUG1,
+			 "pg_monetdb exec timing: rows=%llu batches=%llu query_ms=%.3f fetch_ms=%.3f tuple_conv_ms=%.3f other_local_ms=%.3f fetch_size=%d async=%s",
+			 (unsigned long long) fsstate->fetched_rows,
+			 (unsigned long long) fsstate->fetch_batches,
+			 fsstate->query_ms,
+			 fsstate->fetch_ms,
+			 fsstate->tuple_conv_ms,
+			 fsstate->fetch_ms - fsstate->tuple_conv_ms,
+			 fsstate->fetch_size,
+			 fsstate->async_capable ? "true" : "false");
 
 	/* MemoryContexts will be deleted automatically. */
 }
@@ -4423,6 +4475,7 @@ fetch_more_data(ForeignScanState *node)
 {
 	MonetdbFdwScanState *fsstate = (MonetdbFdwScanState *) node->fdw_state;
 	MemoryContext oldcontext;
+	instr_time	batch_start;
 
 	/*
 	 * We'll store the tuples in the batch_cxt.  First, flush the previous
@@ -4431,6 +4484,7 @@ fetch_more_data(ForeignScanState *node)
 	fsstate->tuples = NULL;
 	MemoryContextReset(fsstate->batch_cxt);
 	oldcontext = MemoryContextSwitchTo(fsstate->batch_cxt);
+	INSTR_TIME_SET_CURRENT(batch_start);
 
 	/* PGresult must be released before leaving this function. */
 	PG_TRY();
@@ -4453,7 +4507,10 @@ fetch_more_data(ForeignScanState *node)
 
 		for (i = 0; i < batch_rows; i++)
 		{
+			instr_time	tuple_start;
+
 			Assert(IsA(node->ss.ps.plan, ForeignScan));
+			INSTR_TIME_SET_CURRENT(tuple_start);
 
 			fsstate->tuples[i] =
 				make_tuple_from_result_row(fsstate->hdl,
@@ -4463,8 +4520,13 @@ fetch_more_data(ForeignScanState *node)
 										   fsstate->retrieved_attrs,
 										   node,
 										   fsstate->temp_cxt);
+				fsstate->tuple_conv_ms += pg_monetdb_instr_time_ms(&tuple_start);
 			fsstate->next_result_row++;
 		}
+
+			fsstate->fetch_ms += pg_monetdb_instr_time_ms(&batch_start);
+			fsstate->fetched_rows += batch_rows;
+			fsstate->fetch_batches++;
 
 		/* Update fetch_ct_2 */
 		if (fsstate->fetch_ct_2 < 2)
