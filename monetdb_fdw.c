@@ -602,10 +602,6 @@ pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root)
 	if (root == NULL || root->parse == NULL)
 		return false;
 
-	if ((root->parse->hasAggs || root->parse->groupClause != NIL) &&
-		!pg_monetdb_fromnode_has_join((Node *) root->parse->jointree))
-		return false;
-
 	return true;
 }
 
