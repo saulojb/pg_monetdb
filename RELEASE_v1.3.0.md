@@ -1,3 +1,9 @@
+<!--
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at http://mozilla.org/MPL/2.0/.
+-->
+
 # pg_monetdb v1.3.0
 
 pg_monetdb v1.3.0 is a stability and usability release for PostgreSQL-to-MonetDB workloads. This release improves SQL helper coverage, fixes bytea/BLOB interoperability, strengthens grouped and upper-relation pushdown planning across newer PostgreSQL versions, and adds PGXN packaging metadata.
