@@ -1,4 +1,10 @@
-/* pg_monetdb--1.1--1.2.sql */
+/*
+ * pg_monetdb--1.1--1.2.sql
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
 CREATE FUNCTION pg_monetdb_query_to_array(server name, statement text) RETURNS SETOF text[]
 LANGUAGE SQL STRICT

@@ -1,4 +1,10 @@
-/* pg_monetdb--1.1.sql */
+/*
+ * pg_monetdb--1.1.sql
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_monetdb" to load this file. \quit

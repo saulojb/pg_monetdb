@@ -7,7 +7,11 @@
  * whether they're safe to send to the remote server for execution.
  *
  * 
- * Portions Copyright (c) 2025-2026, Halo Tech Co.,Ltd. All rights reserved.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * Portions Copyright (c) 2025-2026, Halo Tech Co.,Ltd.
  * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
  * 
  * Author: zengman <zengman@halodbtech.com>
