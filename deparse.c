@@ -5580,3 +5580,421 @@ get_relation_column_alias_ids(Var *node, RelOptInfo *foreignrel,
 	/* Shouldn't get here */
 	elog(ERROR, "unexpected expression in subquery output");
 }
+
+/* -----------------------------------------------------------------------
+ * Whole-query pushdown helpers
+ *
+ * These functions generate MonetDB-compatible SQL directly from a Query*
+ * tree (with CTEs intact), bypassing the planner-level RelOptInfo machinery.
+ * Used when the entire query is fully-foreign and has reused CTEs that
+ * cannot be safely inlined without triggering a MonetDB join bug.
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Build a minimal PlannerInfo that contains only the fields deparseExpr
+ * needs: parse (for planner_rt_fetch) and simple_rte_array.
+ */
+static PlannerInfo *
+build_minimal_plannerinfo_for_query(Query *query)
+{
+	PlannerInfo *root = makeNode(PlannerInfo);
+	int			n = list_length(query->rtable) + 1;
+	int			i = 1;
+	ListCell   *lc;
+
+	root->parse = query;
+	root->query_level = 1;
+	root->simple_rte_array = (RangeTblEntry **)
+		palloc0(n * sizeof(RangeTblEntry *));
+	root->simple_rel_array_size = n;
+
+	foreach(lc, query->rtable)
+		root->simple_rte_array[i++] = lfirst_node(RangeTblEntry, lc);
+
+	return root;
+}
+
+/*
+ * Build a fake RelOptInfo that covers all relations in the query.
+ * deparseVar checks context->scanrel->relids to decide whether a Var
+ * is remote; by including every varno we ensure all columns are emitted.
+ * A zeroed MonetdbFdwRelationInfo as fdw_private makes
+ * is_subquery_var() and is_grouped_subquery_bridge() return false.
+ */
+static RelOptInfo *
+build_allrels_reloptinfo(int n_rels)
+{
+	RelOptInfo			   *rel = makeNode(RelOptInfo);
+	MonetdbFdwRelationInfo *fpinfo;
+
+	rel->reloptkind = RELOPT_JOINREL;
+	rel->relids = bms_add_range(NULL, 1, n_rels);
+	fpinfo = palloc0(sizeof(MonetdbFdwRelationInfo));
+	/* lower_subquery_rels = NULL → is_subquery_var returns false immediately */
+	/* stage = 0 ≠ UPPERREL_GROUP_AGG → is_grouped_subquery_bridge = false  */
+	rel->fdw_private = fpinfo;
+	return rel;
+}
+
+/*
+ * PG19 GROUP BY resolution
+ *
+ * PostgreSQL 19 introduces RTE_GROUP: when a query has GROUP BY, an extra
+ * RTE_GROUP entry is appended to the query's rtable.  Non-aggregate columns
+ * in the SELECT list (and ORDER BY / HAVING) are represented as Vars whose
+ * varno points to this RTE_GROUP entry.  The RTE_GROUP stores the actual
+ * underlying expressions in rte->groupexprs.
+ *
+ * For MonetDB SQL generation we must deparse the UNDERLYING expressions
+ * (e.g. r2.c_custkey) rather than the unresolvable r4.c_custkey alias.
+ * resolve_group_vars_mutator does this substitution recursively.
+ */
+typedef struct ResolveGroupVarsCtx
+{
+	PlannerInfo *root;
+} ResolveGroupVarsCtx;
+
+static Node *
+resolve_group_vars_mutator(Node *node, ResolveGroupVarsCtx *ctx)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var			  *var = (Var *) node;
+		RangeTblEntry *rte;
+
+		if (var->varlevelsup == 0 &&
+			var->varno >= 1 &&
+			var->varno < ctx->root->simple_rel_array_size)
+		{
+			rte = ctx->root->simple_rte_array[var->varno];
+			if (rte != NULL &&
+				rte->rtekind == RTE_GROUP &&
+				var->varattno >= 1 &&
+				var->varattno <= list_length(rte->groupexprs))
+			{
+				/*
+				 * Substitute the Var with the underlying GROUP expression,
+				 * then recurse in case that expression also contains RTE_GROUP
+				 * Vars (nested grouping).
+				 */
+				return resolve_group_vars_mutator(
+					(Node *) list_nth(rte->groupexprs, var->varattno - 1),
+					ctx);
+			}
+		}
+		return (Node *) copyObject(node);
+	}
+
+	return expression_tree_mutator(node, resolve_group_vars_mutator, ctx);
+}
+
+/*
+ * Resolve all RTE_GROUP Vars in an expression tree, returning a new tree.
+ */
+static Expr *
+resolve_group_vars(Expr *expr, PlannerInfo *root)
+{
+	ResolveGroupVarsCtx ctx;
+
+	ctx.root = root;
+	return (Expr *) resolve_group_vars_mutator((Node *) expr, &ctx);
+}
+
+/*
+ * Resolve RTE_GROUP Vars and then deparse.  Used for all expressions in
+ * deparse_query_body_for_monetdb and deparse_fromnode_for_query.
+ */
+static void
+deparse_resolved(Expr *expr, deparse_expr_cxt *context)
+{
+	deparseExpr(resolve_group_vars(expr, context->root), context);
+}
+
+/*
+ * Recursively deparse a join-tree node (RangeTblRef or JoinExpr) into buf.
+ * RTE_RELATION entries are emitted as "monet_schema.table_name rN".
+ * RTE_CTE entries are emitted as "cte_name rN".
+ */
+static void
+deparse_fromnode_for_query(StringInfo buf, Query *query, Node *node,
+						   deparse_expr_cxt *context, bool is_nested)
+{
+	if (IsA(node, RangeTblRef))
+	{
+		RangeTblRef *rtr = (RangeTblRef *) node;
+		RangeTblEntry *rte;
+
+		Assert(rtr->rtindex >= 1 &&
+			   rtr->rtindex <= list_length(query->rtable));
+		rte = rt_fetch(rtr->rtindex, query->rtable);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			ForeignTable *ft = GetForeignTable(rte->relid);
+			const char   *schema = NULL;
+			const char   *tabname = NULL;
+			ListCell	 *lc;
+
+			foreach(lc, ft->options)
+			{
+				DefElem *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "schema_name") == 0)
+					schema = defGetString(def);
+				else if (strcmp(def->defname, "table_name") == 0)
+					tabname = defGetString(def);
+			}
+			if (schema == NULL)
+				schema = get_namespace_name(get_rel_namespace(rte->relid));
+			if (tabname == NULL)
+				tabname = get_rel_name(rte->relid);
+
+			appendStringInfo(buf, "%s.%s %s%d",
+							 quote_identifier(schema),
+							 quote_identifier(tabname),
+							 REL_ALIAS_PREFIX,
+							 rtr->rtindex);
+		}
+		else if (rte->rtekind == RTE_CTE)
+		{
+			appendStringInfo(buf, "%s %s%d",
+							 quote_identifier(rte->ctename),
+							 REL_ALIAS_PREFIX,
+							 rtr->rtindex);
+		}
+		else
+		{
+			elog(ERROR,
+				 "unsupported RTE kind %d in whole-query MonetDB pushdown",
+				 (int) rte->rtekind);
+		}
+	}
+	else if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *join = (JoinExpr *) node;
+		const char *join_str;
+
+		switch (join->jointype)
+		{
+			case JOIN_INNER:
+				join_str = " JOIN ";
+				break;
+			case JOIN_LEFT:
+				join_str = " LEFT JOIN ";
+				break;
+			case JOIN_FULL:
+				join_str = " FULL JOIN ";
+				break;
+			case JOIN_RIGHT:
+				join_str = " RIGHT JOIN ";
+				break;
+			default:
+				join_str = " JOIN ";
+				break;
+		}
+
+		if (is_nested)
+			appendStringInfoChar(buf, '(');
+
+		deparse_fromnode_for_query(buf, query, join->larg, context, true);
+		appendStringInfoString(buf, join_str);
+		deparse_fromnode_for_query(buf, query, join->rarg, context, true);
+
+		if (join->quals)
+		{
+			appendStringInfoString(buf, " ON (");
+			deparse_resolved((Expr *) join->quals, context);
+			appendStringInfoChar(buf, ')');
+		}
+
+		if (is_nested)
+			appendStringInfoChar(buf, ')');
+	}
+	else
+	{
+		elog(ERROR,
+			 "unsupported join tree node type %d in whole-query MonetDB pushdown",
+			 (int) nodeTag(node));
+	}
+}
+
+/*
+ * Deparse a single Query body (SELECT … FROM … WHERE … GROUP BY … HAVING
+ * … ORDER BY … LIMIT …) into MonetDB SQL.  Does NOT emit the leading WITH.
+ */
+static void
+deparse_query_body_for_monetdb(StringInfo buf, Query *query)
+{
+	deparse_expr_cxt context = {0};
+	PlannerInfo *root;
+	RelOptInfo  *allrels;
+	ListCell	*lc;
+	bool		 first;
+
+	root    = build_minimal_plannerinfo_for_query(query);
+	allrels = build_allrels_reloptinfo(list_length(query->rtable));
+
+	context.root        = root;
+	context.foreignrel  = allrels;
+	context.scanrel     = allrels;
+	context.buf         = buf;
+	context.params_list = NULL;
+
+	/* SELECT */
+	appendStringInfoString(buf, "SELECT ");
+	first = true;
+	foreach(lc, query->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		deparse_resolved(tle->expr, &context);
+
+		if (tle->resname)
+			appendStringInfo(buf, " AS %s",
+							 quote_identifier(tle->resname));
+	}
+
+	/* FROM */
+	if (query->jointree != NULL && query->jointree->fromlist != NIL)
+	{
+		appendStringInfoString(buf, " FROM ");
+		first = true;
+		foreach(lc, query->jointree->fromlist)
+		{
+			Node *from_item = (Node *) lfirst(lc);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			deparse_fromnode_for_query(buf, query, from_item, &context, false);
+		}
+	}
+
+	/* WHERE */
+	if (query->jointree != NULL && query->jointree->quals != NULL)
+	{
+		appendStringInfoString(buf, " WHERE ");
+		deparse_resolved((Expr *) query->jointree->quals, &context);
+	}
+
+	/* GROUP BY */
+	if (query->groupClause != NIL)
+	{
+		appendStringInfoString(buf, " GROUP BY ");
+		first = true;
+		foreach(lc, query->groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry		*tle = get_sortgroupclause_tle(sgc,
+														   query->targetList);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			deparse_resolved(tle->expr, &context);
+		}
+	}
+
+	/* HAVING */
+	if (query->havingQual != NULL)
+	{
+		appendStringInfoString(buf, " HAVING ");
+		deparse_resolved((Expr *) query->havingQual, &context);
+	}
+
+	/* ORDER BY */
+	if (query->sortClause != NIL)
+	{
+		appendStringInfoString(buf, " ORDER BY ");
+		first = true;
+		foreach(lc, query->sortClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry		*tle = get_sortgroupclause_tle(sgc,
+														   query->targetList);
+
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			deparse_resolved(tle->expr, &context);
+
+			if (sgc->reverse_sort)
+				appendStringInfoString(buf, " DESC");
+			if (sgc->nulls_first)
+				appendStringInfoString(buf, " NULLS FIRST");
+		}
+	}
+
+	/* LIMIT */
+	if (query->limitCount != NULL)
+	{
+		appendStringInfoString(buf, " LIMIT ");
+		deparseExpr((Expr *) query->limitCount, &context);
+	}
+
+	/* OFFSET */
+	if (query->limitOffset != NULL)
+	{
+		appendStringInfoString(buf, " OFFSET ");
+		deparseExpr((Expr *) query->limitOffset, &context);
+	}
+}
+
+/*
+ * deparseQueryForMonetDB
+ *
+ * Generate a complete MonetDB-compatible SQL string for a fully-foreign query
+ * that includes CTEs (WITH clause).  Each CTE body and the main query body
+ * are recursively deparsed using the existing deparseExpr infrastructure.
+ *
+ * Returns a palloc'd SQL string.
+ */
+char *
+deparseQueryForMonetDB(Query *parse)
+{
+	StringInfoData buf;
+	ListCell	  *lc;
+	bool		   first;
+
+	initStringInfo(&buf);
+
+	/* WITH clause */
+	if (parse->cteList != NIL)
+	{
+		appendStringInfoString(&buf, "WITH ");
+		first = true;
+		foreach(lc, parse->cteList)
+		{
+			CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+			Query		   *cte_query = castNode(Query, cte->ctequery);
+
+			if (!first)
+				appendStringInfoString(&buf, ", ");
+			first = false;
+
+			appendStringInfo(&buf, "%s AS (",
+							 quote_identifier(cte->ctename));
+			deparse_query_body_for_monetdb(&buf, cte_query);
+			appendStringInfoChar(&buf, ')');
+		}
+		appendStringInfoChar(&buf, ' ');
+	}
+
+	/* Main query body */
+	deparse_query_body_for_monetdb(&buf, parse);
+
+	return buf.data;
+}

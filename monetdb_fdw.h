@@ -255,4 +255,7 @@ extern const char *get_jointype_name(JoinType jointype);
 extern bool is_builtin(Oid objectId);
 extern bool is_shippable(Oid objectId, Oid classId, MonetdbFdwRelationInfo *fpinfo);
 
+/* Whole-query pushdown: generate MonetDB SQL from a Query* with CTEs intact */
+extern char *deparseQueryForMonetDB(Query *parse);
+
 #endif							/* MONETDB_FDW_H */

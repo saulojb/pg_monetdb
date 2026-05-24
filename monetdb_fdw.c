@@ -143,6 +143,11 @@ static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 static bool pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel);
 static List *pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 								  RelOptInfo *foreignrel);
+static bool pg_monetdb_query_is_fully_foreign(Query *query, Oid *server_oid_inout);
+static void pg_monetdb_try_inline_reused_ctes(Query *parse);
+static bool pg_monetdb_has_reused_ctes(Query *parse);
+static PlannedStmt *pg_monetdb_build_wholequery_plan(Query *parse,
+								const char *sql, Oid server_oid);
 static void MonetDB_GetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
 					   Oid foreigntableid);
@@ -315,6 +320,9 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 	bool		trace_active = false;
 	PlannedStmt *result;
 
+	elog(DEBUG1, "pg_monetdb_planner called: cteList_len=%d",
+		 parse != NULL ? list_length(parse->cteList) : -1);
+
 	if (pg_monetdb_enable_planner_hook_debug &&
 		pg_monetdb_query_needs_planner_trace(parse, query_string))
 	{
@@ -347,6 +355,41 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 			pg_monetdb_log_query_shape(subquery, "sublink");
 		}
 	}
+
+	/*
+	 * Whole-query pushdown: if the query is fully-foreign and has non-recursive
+	 * CTEs that are referenced more than once, send the original WITH query
+	 * directly to MonetDB instead of inlining the CTEs.  Inlining reused CTEs
+	 * triggers a MonetDB join bug that returns 0 rows.
+	 */
+	if (parse->commandType == CMD_SELECT &&
+		parse->cteList != NIL &&
+		pg_monetdb_has_reused_ctes(parse))
+	{
+		Oid		server_oid = InvalidOid;
+
+		if (pg_monetdb_query_is_fully_foreign(parse, &server_oid) &&
+			OidIsValid(server_oid))
+		{
+			char	   *monet_sql;
+			PlannedStmt *ps;
+
+			monet_sql = deparseQueryForMonetDB(parse);
+			elog(DEBUG1,
+				 "pg_monetdb whole-query pushdown SQL: %s", monet_sql);
+			ps = pg_monetdb_build_wholequery_plan(parse, monet_sql, server_oid);
+			return ps;
+		}
+	}
+
+	/*
+	 * Before handing off to the standard planner, try to inline any CTEs that
+	 * are referenced more than once (cterefcount > 1) when the whole query is
+	 * backed entirely by foreign tables on the same MonetDB server.  This lets
+	 * the grouped-bridge and join-pushdown machinery push the whole query
+	 * remotely instead of materialising CTE results locally.
+	 */
+	pg_monetdb_try_inline_reused_ctes(parse);
 
 	result = pg_monetdb_plan_with_next(parse, query_string,
 						  cursorOptions, boundParams
@@ -674,6 +717,319 @@ pg_monetdb_is_grouped_bridge_rel(RelOptInfo *rel)
 
 	fpinfo = (MonetdbFdwRelationInfo *) rel->fdw_private;
 	return (!IS_UPPER_REL(rel) && fpinfo->stage == UPPERREL_GROUP_AGG);
+}
+
+/*
+ * pg_monetdb_query_is_fully_foreign
+ *
+ * Recursively checks that every leaf RTE_RELATION in a query (and in all its
+ * CTEs and RTE_SUBQUERY entries) is a foreign table on the same MonetDB
+ * server.  server_oid_inout accumulates the server OID found so far; the
+ * caller initialises it to InvalidOid.
+ */
+static bool
+pg_monetdb_query_is_fully_foreign(Query *query, Oid *server_oid_inout)
+{
+	ListCell   *lc;
+
+	if (query == NULL)
+		return false;
+
+	/* Walk CTE bodies recursively */
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (!pg_monetdb_query_is_fully_foreign(castNode(Query, cte->ctequery),
+											  server_oid_inout))
+			return false;
+	}
+
+	/* Walk the range table */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		switch (rte->rtekind)
+		{
+			case RTE_RELATION:
+				{
+					Oid			server_oid;
+
+					if (get_rel_relkind(rte->relid) != RELKIND_FOREIGN_TABLE)
+						return false;
+
+					server_oid = GetForeignTable(rte->relid)->serverid;
+
+					if (*server_oid_inout == InvalidOid)
+						*server_oid_inout = server_oid;
+					else if (*server_oid_inout != server_oid)
+						return false;	/* tables on different servers */
+				}
+				break;
+
+			case RTE_SUBQUERY:
+				if (!pg_monetdb_query_is_fully_foreign(rte->subquery,
+													  server_oid_inout))
+					return false;
+				break;
+
+			case RTE_CTE:
+			case RTE_JOIN:
+			case RTE_RESULT:
+#if PG_VERSION_NUM >= 170000
+			case RTE_GROUP:
+#endif
+				/* Structural entries – not leaf table refs */
+				break;
+
+			default:
+				/* Functions, VALUES, TABLESAMPLE, etc. – not pushable */
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * pg_monetdb_try_inline_reused_ctes
+ *
+ * If the query contains CTEs that are referenced more than once AND all base
+ * tables in the entire query tree are foreign tables on the same MonetDB
+ * server, mark those reused CTEs as NOT MATERIALIZED.  PostgreSQL will then
+ * inline them as subqueries before planning, letting the existing grouped-
+ * bridge and join-pushdown machinery push the whole query to MonetDB.
+ *
+ * Semantics are preserved: all references are reads from the same remote
+ * server, so inline vs materialise produces identical results.
+ */
+static void
+pg_monetdb_try_inline_reused_ctes(Query *parse)
+{
+	ListCell   *lc;
+	Oid			server_oid = InvalidOid;
+	bool		has_reused = false;
+
+	elog(DEBUG1, "pg_monetdb_try_inline_reused_ctes: parse=%s cteList_len=%d",
+		 parse != NULL ? "non-null" : "null",
+		 parse != NULL ? list_length(parse->cteList) : -1);
+
+	if (parse == NULL || parse->cteList == NIL)
+		return;
+
+	elog(DEBUG1, "pg_monetdb_try_inline_reused_ctes called: cteList len=%d",
+		 list_length(parse->cteList));
+
+	/* Quick check: any CTE used more than once? */
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->cterefcount > 1 && !cte->cterecursive &&
+			cte->ctematerialized != CTEMaterializeAlways)
+		{
+			has_reused = true;
+			break;
+		}
+	}
+
+	if (!has_reused)
+		return;
+
+	/* All leaf tables must be foreign tables on the same MonetDB server */
+	{
+		bool		is_foreign = pg_monetdb_query_is_fully_foreign(parse, &server_oid);
+
+		elog(DEBUG1,
+			 "pg_monetdb_try_inline_reused_ctes: has_reused=true is_foreign=%s server_oid=%u",
+			 is_foreign ? "true" : "false", server_oid);
+
+		if (!is_foreign || !OidIsValid(server_oid))
+			return;
+	}
+
+	/* Force inline on every reused non-recursive CTE */
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->cterefcount > 1 && !cte->cterecursive &&
+			cte->ctematerialized != CTEMaterializeAlways)
+		{
+			if (pg_monetdb_enable_planner_hook_debug)
+				elog(DEBUG1,
+					 "pg_monetdb inline reused CTE: ctename=%s cterefcount=%d server=%u",
+					 cte->ctename != NULL ? cte->ctename : "<null>",
+					 cte->cterefcount,
+					 server_oid);
+			cte->ctematerialized = CTEMaterializeNever;
+		}
+	}
+}
+
+/*
+ * pg_monetdb_has_reused_ctes
+ *
+ * Returns true if the query has any non-recursive CTE that is referenced
+ * more than once (cterefcount > 1).
+ */
+static bool
+pg_monetdb_has_reused_ctes(Query *parse)
+{
+	ListCell   *lc;
+
+	if (parse == NULL || parse->cteList == NIL)
+		return false;
+
+	foreach(lc, parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->cterefcount > 1 && !cte->cterecursive)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * pg_monetdb_build_wholequery_plan
+ *
+ * Build a minimal PlannedStmt that wraps a single ForeignScan executing
+ * the given MonetDB SQL string.  The output columns are taken directly
+ * from parse->targetList.
+ */
+static PlannedStmt *
+pg_monetdb_build_wholequery_plan(Query *parse, const char *sql, Oid server_oid)
+{
+	ForeignScan *fscan;
+	PlannedStmt *ps;
+	List	   *plan_tlist = NIL;
+	List	   *fdw_scan_tlist = NIL;
+	List	   *fdw_private;
+	List	   *retrieved_attrs = NIL;
+	ListCell   *lc;
+	int			attno = 1;
+	Bitmapset  *base_relids = NULL;
+	int			fetch_size = 100; /* default */
+
+	/*
+	 * Use RT index 1 as the nominal base relation for fs_relids.  The
+	 * top-level rtable contains CTE-reference RTEs (not foreign table RTEs),
+	 * so the RTE fetched in MonetDB_BeginForeignScan won't pass the
+	 * RELKIND_FOREIGN_TABLE check — which means serverid stays as the value
+	 * we stored in fdw_private[FdwScanPrivateServerId].  That is correct.
+	 */
+	if (parse->rtable == NIL)
+		elog(ERROR, "pg_monetdb_build_wholequery_plan: empty rtable");
+	base_relids = bms_make_singleton(1);
+
+	/* Build fdw_scan_tlist from the non-junk entries in parse->targetList */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *ote = lfirst_node(TargetEntry, lc);
+		TargetEntry *scan_tle;
+		TargetEntry *plan_tle;
+		Var	   *var;
+		Oid			expr_type;
+		int32		expr_typmod;
+		Oid			expr_collation;
+
+		if (ote->resjunk)
+			continue;
+
+		expr_type = exprType((Node *) ote->expr);
+		expr_typmod = exprTypmod((Node *) ote->expr);
+		expr_collation = exprCollation((Node *) ote->expr);
+
+		elog(DEBUG1, "pg_monetdb wholequery TLE %d: resname=%s exprType=%u (%s) resjunk=%d",
+			 attno,
+			 ote->resname ? ote->resname : "<null>",
+			 (unsigned) expr_type,
+			 format_type_be(expr_type),
+			 (int) ote->resjunk);
+
+		scan_tle = makeTargetEntry(ote->expr, attno, ote->resname, false);
+		fdw_scan_tlist = lappend(fdw_scan_tlist, scan_tle);
+
+		/*
+		 * Planner hooks bypass core setrefs, so the top ForeignScan targetlist
+		 * must already reference fdw_scan_tlist entries via INDEX_VAR.
+		 */
+		var = makeVar(INDEX_VAR,
+					  attno,
+					  expr_type,
+					  expr_typmod,
+					  expr_collation,
+					  0);
+		plan_tle = makeTargetEntry((Expr *) var, attno, ote->resname, false);
+		plan_tlist = lappend(plan_tlist, plan_tle);
+
+		retrieved_attrs = lappend_int(retrieved_attrs, attno);
+		attno++;
+	}
+
+	/* Build fdw_private in the standard FDW layout */
+	fdw_private = list_make4(
+		makeString(pstrdup(sql)),
+		retrieved_attrs,
+		makeInteger(fetch_size),
+		makeInteger((int) server_oid)
+	);
+	/* Append a marker so EXPLAIN can identify this as a whole-query scan */
+	fdw_private = lappend(fdw_private,
+						  makeString("WHOLE_QUERY_PUSHDOWN"));
+
+	/* Create ForeignScan node */
+	fscan = makeNode(ForeignScan);
+	fscan->scan.plan.targetlist = plan_tlist;
+	fscan->scan.plan.qual = NIL;
+	fscan->scan.plan.lefttree = NULL;
+	fscan->scan.plan.righttree = NULL;
+	fscan->scan.plan.startup_cost = 10000;
+	fscan->scan.plan.total_cost = 1000000;
+	fscan->scan.plan.plan_rows = 100;
+	fscan->scan.plan.plan_width = 100;
+	fscan->scan.scanrelid = 0;	/* 0 = join/upper style → uses fdw_scan_tlist */
+	fscan->operation = CMD_SELECT;
+	fscan->resultRelation = 0;
+	fscan->checkAsUser = InvalidOid;
+	fscan->fs_server = server_oid;
+	fscan->fs_relids = base_relids;
+	fscan->fs_base_relids = base_relids;
+	fscan->fdw_exprs = NIL;
+	fscan->fdw_private = fdw_private;
+	fscan->fdw_scan_tlist = fdw_scan_tlist;
+	fscan->fdw_recheck_quals = NIL;
+	fscan->fsSystemCol = false;
+
+	/* Build PlannedStmt */
+	ps = makeNode(PlannedStmt);
+	ps->commandType = CMD_SELECT;
+	ps->queryId = parse->queryId;
+	ps->hasReturning = false;
+	ps->hasModifyingCTE = false;
+	ps->canSetTag = parse->canSetTag;
+	ps->transientPlan = false;
+	ps->dependsOnRole = false;
+	ps->parallelModeNeeded = false;
+	ps->planTree = (Plan *) fscan;
+	ps->rtable = parse->rtable;
+#if PG_VERSION_NUM >= 160000
+	ps->permInfos = parse->rteperminfos;
+#endif
+	ps->resultRelationRelids = NULL;
+	ps->appendRelations = NIL;
+	ps->subplans = NIL;
+	ps->rewindPlanIDs = NULL;
+	ps->rowMarks = NIL;
+	ps->relationOids = NIL;
+	ps->invalItems = NIL;
+	ps->paramExecTypes = NIL;
+	ps->stmt_location = parse->stmt_location;
+	ps->stmt_len = parse->stmt_len;
+
+	return ps;
 }
 
 static bool
@@ -2724,6 +3080,31 @@ MonetDB_BeginForeignScan(ForeignScanState *node, int eflags)
 	}
 
 	fsstate->attinmeta = TupleDescGetAttInMetadata(fsstate->tupdesc);
+
+	/* Debug: log result descriptor types for whole-query pushdown */
+	{
+		TupleDesc rdesc = node->ss.ps.ps_ResultTupleDesc;
+		TupleDesc sdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+		int i;
+		if (rdesc)
+		{
+			for (i = 0; i < rdesc->natts; i++)
+				elog(DEBUG1, "BeginForeignScan result col %d: name=%s type=%u (%s)",
+					 i + 1,
+					 NameStr(TupleDescAttr(rdesc, i)->attname),
+					 TupleDescAttr(rdesc, i)->atttypid,
+					 format_type_be(TupleDescAttr(rdesc, i)->atttypid));
+		}
+		if (sdesc)
+		{
+			for (i = 0; i < sdesc->natts; i++)
+				elog(DEBUG1, "BeginForeignScan scan col %d: name=%s type=%u (%s)",
+					 i + 1,
+					 NameStr(TupleDescAttr(sdesc, i)->attname),
+					 TupleDescAttr(sdesc, i)->atttypid,
+					 format_type_be(TupleDescAttr(sdesc, i)->atttypid));
+		}
+	}
 
 	/*
 	 * Prepare for processing of parameters used in remote query, if any.
