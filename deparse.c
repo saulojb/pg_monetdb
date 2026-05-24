@@ -218,6 +218,7 @@ static bool is_subquery_var(Var *node, RelOptInfo *foreignrel,
 static bool is_grouped_subquery_bridge(RelOptInfo *rel);
 static bool deparse_grouped_subquery_bridge_var(Var *node,
 							deparse_expr_cxt *context);
+static char *deparseByteaHexLiteral(Datum value, Oid type);
 static void deparse_grouped_subquery_from_node(StringInfo buf,
 							 Query *subquery,
 							 Node *node,
@@ -3903,6 +3904,7 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	Oid			typoutput;
 	bool		typIsVarlena;
 	char	   *extval;
+	Oid			basetype = getBaseType(node->consttype);
 
 	if (node->constisnull)
 	{
@@ -3910,11 +3912,19 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 		return;
 	}
 
+	if (basetype == BYTEAOID)
+	{
+		extval = deparseByteaHexLiteral(node->constvalue, node->consttype);
+		deparseStringLiteral(buf, extval);
+		pfree(extval);
+		return;
+	}
+
 	getTypeOutputInfo(node->consttype,
 					  &typoutput, &typIsVarlena);
 	extval = OidOutputFunctionCall(typoutput, node->constvalue);
 
-	switch (node->consttype)
+	switch (basetype)
 	{
 		case DATEOID:
 			appendStringInfoString(buf, "DATE ");
@@ -3973,6 +3983,39 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	}
 
 	pfree(extval);
+}
+
+static char *
+deparseByteaHexLiteral(Datum value, Oid type)
+{
+	bytea	  *bytea_value;
+	char	   *hex;
+	char	   *dst;
+	char	   *src;
+	static const char hexdigits[] = "0123456789abcdef";
+	int		len;
+
+	Assert(getBaseType(type) == BYTEAOID);
+
+	bytea_value = DatumGetByteaPP(value);
+	len = VARSIZE_ANY_EXHDR(bytea_value);
+	hex = palloc(len * 2 + 1);
+	dst = hex;
+	src = VARDATA_ANY(bytea_value);
+
+	for (int i = 0; i < len; i++)
+	{
+		unsigned char byte = (unsigned char) src[i];
+
+		*dst++ = hexdigits[byte >> 4];
+		*dst++ = hexdigits[byte & 0x0F];
+	}
+	*dst = '\0';
+
+	if ((Pointer) bytea_value != DatumGetPointer(value))
+		pfree(bytea_value);
+
+	return hex;
 }
 
 /*

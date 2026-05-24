@@ -1368,6 +1368,8 @@ pg_monetdb_rtekind_name(RTEKind rtekind)
 			return "RTE_CTE";
 		case RTE_NAMEDTUPLESTORE:
 			return "RTE_NAMEDTUPLESTORE";
+		case RTE_GRAPH_TABLE:
+			return "RTE_GRAPH_TABLE";
 
 #if PG_VERSION_NUM >= 180000
 		case RTE_GROUP:
@@ -1507,8 +1509,10 @@ typedef struct MonetdbFdwModifyState
 	/* info about parameters for prepared statement */
 	int			p_nums;			/* number of parameters to transmit */
 	FmgrInfo   *p_flinfo;		/* output conversion functions for them */
+	Oid		   *p_types;			/* parameter types for target attrs */
 	List	   *key_attnums;		/* attnum of input resjunk key column */
 	FmgrInfo   *key_flinfo;
+	Oid		   *key_types;		/* parameter types for key attrs */
 	/* batch operation stuff */
 	int			num_slots;		/* number of slots to insert */
 
@@ -1734,6 +1738,7 @@ static void prepare_query_params(PlanState *node,
 								 List **param_exprs,
 								 const char ***param_values,
 								 Oid **param_types);
+static char *monetdb_convert_binary_parameter(Datum value, Oid type);
 static char *build_parameterized_query(const char *query_template,
 									   int numParams,
 									   FmgrInfo *param_flinfo,
@@ -5168,6 +5173,41 @@ prepare_query_params(PlanState *node,
 	*param_values = (const char **) palloc0(numParams * sizeof(char *));
 }
 
+static char *
+monetdb_convert_binary_parameter(Datum value, Oid type)
+{
+	bytea	  *bytea_value;
+	char	   *hex;
+	char	   *dst;
+	char	   *src;
+	static const char hexdigits[] = "0123456789abcdef";
+	int		len;
+	Oid		basetype = getBaseType(type);
+
+	if (basetype != BYTEAOID)
+		return NULL;
+
+	bytea_value = DatumGetByteaPP(value);
+	len = VARSIZE_ANY_EXHDR(bytea_value);
+	hex = palloc(len * 2 + 1);
+	dst = hex;
+	src = VARDATA_ANY(bytea_value);
+
+	for (int i = 0; i < len; i++)
+	{
+		unsigned char byte = (unsigned char) src[i];
+
+		*dst++ = hexdigits[byte >> 4];
+		*dst++ = hexdigits[byte & 0x0F];
+	}
+	*dst = '\0';
+
+	if ((Pointer) bytea_value != DatumGetPointer(value))
+		pfree(bytea_value);
+
+	return hex;
+}
+
 /*
  * build_parameterized_query
  *		Evaluate runtime parameters and return a copy of query_template with
@@ -5245,10 +5285,14 @@ build_parameterized_query(const char *query_template,
 				}
 				else
 				{
-					char   *extval = OutputFunctionCall(&param_flinfo[idx],
-														values[idx]);
+					char   *extval = monetdb_convert_binary_parameter(values[idx],
+													   param_types[idx]);
 
-					switch (param_types[idx])
+					if (extval == NULL)
+						extval = OutputFunctionCall(&param_flinfo[idx],
+														 values[idx]);
+
+					switch (getBaseType(param_types[idx]))
 					{
 						case INT2OID:
 						case INT4OID:
@@ -7303,6 +7347,7 @@ static MonetdbFdwModifyState *create_foreign_modify(EState *estate,
 		
 		/* There may be some waste here but that's okay */
 		fmstate->key_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * tupdesc->natts);
+		fmstate->key_types = (Oid *) palloc0(sizeof(Oid) * tupdesc->natts);
 		/* loop through all columns of the foreign table */
 		for (int i = 0; i < tupdesc->natts; ++i)
 		{
@@ -7332,6 +7377,7 @@ static MonetdbFdwModifyState *create_foreign_modify(EState *estate,
 					/* First transmittable parameter will be key */
 					getTypeOutputInfo(attrtype, &typefnoid, &isvarlena);
 					fmgr_info(typefnoid, &fmstate->key_flinfo[keynum]);
+					fmstate->key_types[keynum] = attrtype;
 					++keynum;
 				}
 			}
@@ -7342,6 +7388,7 @@ static MonetdbFdwModifyState *create_foreign_modify(EState *estate,
 	/* There may be some waste here but that's okay */
 	n_params = list_length(fmstate->target_attrs) + list_length(fmstate->key_attnums);
 	fmstate->p_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * n_params);
+	fmstate->p_types = (Oid *) palloc0(sizeof(Oid) * n_params);
 
 	if (operation == CMD_INSERT || operation == CMD_UPDATE)
 	{
@@ -7358,6 +7405,7 @@ static MonetdbFdwModifyState *create_foreign_modify(EState *estate,
 				continue;
 			getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
 			fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+			fmstate->p_types[fmstate->p_nums] = attr->atttypid;
 			fmstate->p_nums++;
 		}
 	}
@@ -7538,11 +7586,15 @@ convert_prep_stmt_params(MonetdbFdwModifyState *fmstate,
 					p_values[pindex] = NULL;
 				else
 				{
+					char  	*val = monetdb_convert_binary_parameter(value,
+													 attr->atttypid);
+
 					/* 
 					 * There are some types of results that are not recognized by MonetDB,
 					 * and we need to make simple changes to achieve the purpose
 					 */
-					char 	*val = OutputFunctionCall(&fmstate->p_flinfo[j], value);
+					if (val == NULL)
+						val = OutputFunctionCall(&fmstate->p_flinfo[j], value);
 					if (attr->atttypid == BOOLOID)
 					{
 						/* 
@@ -7578,7 +7630,10 @@ convert_prep_stmt_params(MonetdbFdwModifyState *fmstate,
 		ItemPointer	attnum = lfirst(cell);
 		Assert(numSlots == 1);
 		/* Data about the primary key */
-		p_values[pindex] = OutputFunctionCall(&fmstate->key_flinfo[j], PointerGetDatum(attnum));
+		p_values[pindex] = monetdb_convert_binary_parameter(PointerGetDatum(attnum),
+													 fmstate->key_types[j]);
+		if (p_values[pindex] == NULL)
+			p_values[pindex] = OutputFunctionCall(&fmstate->key_flinfo[j], PointerGetDatum(attnum));
 		pindex++;
 		j++;
 	}
