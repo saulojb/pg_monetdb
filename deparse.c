@@ -1427,11 +1427,29 @@ build_tlist_to_deparse(RelOptInfo *foreignrel)
 	ListCell   *lc;
 
 	/*
-	 * For an upper relation, we have already built the target list while
-	 * checking shippability, so just return that.
+	 * GROUP_AGG upper rels precompute a dedicated grouped_tlist that carries
+	 * the correct ressortgroupref values.  ORDERED/FINAL upper rels emit the
+	 * same SELECT columns, so they should use that same list.  Walk up the
+	 * outerrel chain until we find one.
 	 */
 	if (IS_UPPER_REL(foreignrel))
-		return fpinfo->grouped_tlist;
+	{
+		RelOptInfo *cur = foreignrel;
+
+		while (cur != NULL)
+		{
+			MonetdbFdwRelationInfo *cur_fp =
+				(MonetdbFdwRelationInfo *) cur->fdw_private;
+
+			if (cur_fp == NULL)
+				break;
+			if (cur_fp->grouped_tlist != NIL)
+				return cur_fp->grouped_tlist;
+			if (!IS_UPPER_REL(cur))
+				break;
+			cur = cur_fp->outerrel;
+		}
+	}
 
 	/*
 	 * We require columns specified in foreignrel->reltarget->exprs and those
@@ -1439,14 +1457,16 @@ build_tlist_to_deparse(RelOptInfo *foreignrel)
 	 */
 	tlist = add_to_flat_tlist(tlist,
 							  pull_var_clause((Node *) foreignrel->reltarget->exprs,
-										 PVC_RECURSE_PLACEHOLDERS));
+									 PVC_RECURSE_AGGREGATES |
+									 PVC_RECURSE_PLACEHOLDERS));
 	foreach(lc, fpinfo->local_conds)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
 		tlist = add_to_flat_tlist(tlist,
 								  pull_var_clause((Node *) rinfo->clause,
-											 PVC_RECURSE_PLACEHOLDERS));
+										 PVC_RECURSE_AGGREGATES |
+										 PVC_RECURSE_PLACEHOLDERS));
 	}
 
 	return tlist;
@@ -1516,8 +1536,29 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.buf = buf;
 	context.root = root;
 	context.foreignrel = rel;
-	context.scanrel = grouped_bridge ? rel :
-		(IS_UPPER_REL(rel) ? fpinfo->outerrel : rel);
+	/*
+	 * Determine the scan rel for the FROM clause.  For stacked upper rels
+	 * (e.g. UPPERREL_ORDERED whose outerrel is UPPERREL_GROUP_AGG), we must
+	 * drill down through the chain until we reach an actual base/join rel,
+	 * because deparseFromExprForRel cannot handle an upper rel as input
+	 * (upper rels have relid=0 and no rangetable entry).
+	 */
+	{
+		RelOptInfo *outer = IS_UPPER_REL(rel) ? fpinfo->outerrel : NULL;
+
+		while (outer != NULL && IS_UPPER_REL(outer) &&
+			   !is_grouped_subquery_bridge(outer))
+		{
+			MonetdbFdwRelationInfo *outer_fp =
+				(MonetdbFdwRelationInfo *) outer->fdw_private;
+
+			if (outer_fp == NULL || outer_fp->outerrel == NULL)
+				break;
+			outer = outer_fp->outerrel;
+		}
+		context.scanrel = grouped_bridge ? rel :
+			(IS_UPPER_REL(rel) ? outer : rel);
+	}
 	context.params_list = params_list;
 	grouped_context = context;
 	grouped_context.grouped_subquery_inner = grouped_bridge;
@@ -1539,7 +1580,12 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 		{
 			MonetdbFdwRelationInfo *ofpinfo;
 
-			ofpinfo = (MonetdbFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+			/*
+			 * context.scanrel is the drilled-down base/join rel, so its
+			 * remote_conds contain the correct WHERE predicates regardless
+			 * of how many upper-rel levels sit above it.
+			 */
+			ofpinfo = (MonetdbFdwRelationInfo *) context.scanrel->fdw_private;
 			quals = ofpinfo->remote_conds;
 		}
 	}
@@ -5183,6 +5229,30 @@ appendOrderByClause(List *pathkeys, bool has_final_sort,
 			em = find_em_for_rel_target(context->root,
 										pathkey->pk_eclass,
 										context->foreignrel);
+			/*
+			 * For ORDERED upper rels whose outerrel is a GROUP_AGG upper rel,
+			 * the ORDERED reltarget may not have the correct sortgroupref
+			 * annotations (the shippability check used the GROUP_AGG rel's
+			 * target instead).  Retry against outerrel (GROUP_AGG) first,
+			 * which mirrors what add_foreign_ordered_paths checked, then fall
+			 * back to find_em_for_rel against the underlying scan rel (covers
+			 * plain-Var ORDER BY keys).
+			 */
+			if (em == NULL && IS_UPPER_REL(context->foreignrel))
+			{
+				MonetdbFdwRelationInfo *ffp =
+					(MonetdbFdwRelationInfo *) context->foreignrel->fdw_private;
+
+				if (ffp != NULL && ffp->outerrel != NULL)
+					em = find_em_for_rel_target(context->root,
+												pathkey->pk_eclass,
+												ffp->outerrel);
+				if (em == NULL &&
+					context->scanrel != NULL && !IS_UPPER_REL(context->scanrel))
+					em = find_em_for_rel(context->root,
+										 pathkey->pk_eclass,
+										 context->scanrel);
+			}
 		}
 		else
 			em = find_em_for_rel(context->root,

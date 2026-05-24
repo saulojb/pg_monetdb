@@ -119,8 +119,13 @@ static PlannedStmt *pg_monetdb_plan_with_next(Query *parse,
 #endif
 								 );
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
-static bool pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte,
-										 Oid *relid_out);
+static CommonTableExpr *pg_monetdb_get_cte_for_rte(PlannerInfo *root,
+								 RangeTblEntry *rte);
+static Query *pg_monetdb_get_grouped_query_for_rte(PlannerInfo *root,
+								 RangeTblEntry *rte);
+static bool pg_monetdb_is_single_foreign_grouped_query(PlannerInfo *root,
+								 RangeTblEntry *rte,
+								 Oid *relid_out);
 static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
 						 Node *fromnode,
 						 Oid *relid_out,
@@ -128,6 +133,7 @@ static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
 static bool pg_monetdb_fromnode_has_join(Node *node);
 static bool pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root);
 static bool pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root);
+static bool pg_monetdb_is_reused_nested_cte_query(PlannerInfo *root);
 static bool pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
 									 RelOptInfo *input_rel);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
@@ -150,6 +156,7 @@ static void MonetDB_GetForeignJoinPaths(PlannerInfo *root,
 						   JoinType jointype,
 						   JoinPathExtraData *extra);
 static void pg_monetdb_log_query_shape(Query *query, const char *label);
+static void pg_monetdb_log_rel_target(RelOptInfo *rel, const char *label);
 static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
 static const char *pg_monetdb_upper_stage_name(UpperRelationKind stage);
@@ -410,8 +417,16 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
 		pg_monetdb_should_attach_grouped_bridge(root) &&
-		pg_monetdb_is_single_foreign_grouped_subquery(rte, &derived_relid))
+		pg_monetdb_is_single_foreign_grouped_query(root, rte, &derived_relid))
 	{
+		if (pg_monetdb_enable_planner_hook_debug)
+			elog(DEBUG1,
+				 "pg_monetdb rel hook: attaching grouped bridge rti=%u rtekind=%s relid=%u ctename=%s derived_relid=%u",
+				 rti,
+				 pg_monetdb_rtekind_name(rte->rtekind),
+				 rte->relid,
+				 rte->rtekind == RTE_CTE && rte->ctename != NULL ? rte->ctename : "<none>",
+				 derived_relid);
 		pg_monetdb_attach_grouped_subquery_fpinfo(rel, rti, rte, derived_relid);
 		grouped_bridge = true;
 	}
@@ -453,17 +468,79 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		next_set_rel_pathlist_hook(root, rel, rti, rte);
 }
 
+static Query *
+pg_monetdb_get_grouped_query_for_rte(PlannerInfo *root, RangeTblEntry *rte)
+{
+	CommonTableExpr *cte;
+
+	if (rte == NULL)
+		return NULL;
+
+	if (rte->rtekind == RTE_SUBQUERY)
+		return rte->subquery;
+
+	cte = pg_monetdb_get_cte_for_rte(root, rte);
+	if (cte == NULL)
+		return NULL;
+
+	return castNode(Query, cte->ctequery);
+}
+
+static CommonTableExpr *
+pg_monetdb_get_cte_for_rte(PlannerInfo *root, RangeTblEntry *rte)
+{
+	PlannerInfo *cte_root;
+	ListCell   *lc;
+	int			levels_up;
+
+	if (rte == NULL)
+		return NULL;
+
+	if (rte->rtekind != RTE_CTE || rte->self_reference)
+		return NULL;
+
+	cte_root = root;
+	levels_up = rte->ctelevelsup;
+	while (cte_root != NULL && levels_up-- > 0)
+		cte_root = cte_root->parent_root;
+
+	if (cte_root == NULL || cte_root->parse == NULL)
+		return NULL;
+
+	foreach(lc, cte_root->parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (strcmp(cte->ctename, rte->ctename) == 0)
+			return cte;
+	}
+
+	return NULL;
+}
+
 static bool
-pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out)
+pg_monetdb_is_single_foreign_grouped_query(PlannerInfo *root,
+							   RangeTblEntry *rte,
+							   Oid *relid_out)
 {
 	Query	   *subquery;
+	CommonTableExpr *cte;
 	Node	   *fromnode;
 
 	if (relid_out != NULL)
 		*relid_out = InvalidOid;
 
-	if (rte == NULL || rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+	subquery = pg_monetdb_get_grouped_query_for_rte(root, rte);
+	if (subquery == NULL)
 		return false;
+
+	cte = pg_monetdb_get_cte_for_rte(root, rte);
+	if (cte != NULL)
+	{
+		if (cte->ctematerialized == CTEMaterializeAlways ||
+			cte->cterecursive || cte->cterefcount != 1)
+			return false;
+	}
 
 	/*
 	 * Derived grouped subqueries from the query text have no relid.  View
@@ -474,8 +551,6 @@ pg_monetdb_is_single_foreign_grouped_subquery(RangeTblEntry *rte, Oid *relid_out
 	if (OidIsValid(rte->relid) &&
 		get_rel_relkind(rte->relid) != RELKIND_VIEW)
 		return false;
-
-	subquery = rte->subquery;
 
 	if (!subquery->hasAggs || subquery->groupClause == NIL ||
 		subquery->hasSubLinks)
@@ -676,6 +751,43 @@ pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root)
 }
 
 static bool
+pg_monetdb_is_reused_nested_cte_query(PlannerInfo *root)
+{
+	ListCell   *lc;
+	const char *plan_name;
+
+	if (root == NULL || root->parent_root == NULL || root->parse == NULL ||
+		root->parent_root->parse == NULL)
+		return false;
+
+	plan_name = root->plan_name;
+	if (plan_name != NULL)
+	{
+		foreach(lc, root->parent_root->parse->cteList)
+		{
+			CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+			if (cte->ctename == NULL || strcmp(cte->ctename, plan_name) != 0)
+				continue;
+
+			return (!cte->cterecursive && cte->cterefcount > 1);
+		}
+	}
+
+	foreach(lc, root->parent_root->parse->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		if (cte->ctequery != (Node *) root->parse)
+			continue;
+
+		return (!cte->cterecursive && cte->cterefcount > 1);
+	}
+
+	return false;
+}
+
+static bool
 pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
 									 RelOptInfo *input_rel)
 {
@@ -701,6 +813,7 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 								  RelOptInfo *foreignrel)
 {
 	RangeTblEntry *rte;
+	Query	   *grouped_query;
 	List	   *tlist = NIL;
 	ListCell   *lc;
 	AttrNumber	output_attno = 1;
@@ -708,10 +821,10 @@ pg_monetdb_build_grouped_bridge_scan_tlist(PlannerInfo *root,
 	Assert(pg_monetdb_is_grouped_bridge_rel(foreignrel));
 
 	rte = planner_rt_fetch(foreignrel->relid, root);
-	Assert(rte->rtekind == RTE_SUBQUERY);
-	Assert(rte->subquery != NULL);
+	grouped_query = pg_monetdb_get_grouped_query_for_rte(root, rte);
+	Assert(grouped_query != NULL);
 
-	foreach(lc, rte->subquery->targetList)
+	foreach(lc, grouped_query->targetList)
 	{
 		TargetEntry *subquery_tle = lfirst_node(TargetEntry, lc);
 		Var	   *var;
@@ -861,6 +974,21 @@ pg_monetdb_log_query_shape(Query *query, const char *label)
 			 rte->subquery != NULL ? "true" : "false");
 		index++;
 	}
+}
+
+static void
+pg_monetdb_log_rel_target(RelOptInfo *rel, const char *label)
+{
+	if (rel == NULL || rel->reltarget == NULL)
+		return;
+
+	elog(DEBUG1,
+		 "pg_monetdb %s reltarget: relids=%s width=%d exprs=%d expr_tree=%s",
+		 label,
+		 rel->relids != NULL ? bmsToString(rel->relids) : "<null>",
+		 rel->reltarget->width,
+		 list_length(rel->reltarget->exprs),
+		 nodeToString((Node *) rel->reltarget->exprs));
 }
 
 static const char *
@@ -2153,11 +2281,12 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 					   List *scan_clauses,
 					   Plan *outer_plan)
 {
-	Query	   *parse = root->parse;
 	MonetdbFdwRelationInfo *fpinfo = (MonetdbFdwRelationInfo *) foreignrel->fdw_private;
+	RangeTblEntry *scan_rte = NULL;
 	Index		scan_relid;
 	bool		grouped_bridge = IS_SIMPLE_REL(foreignrel) &&
 		pg_monetdb_is_grouped_bridge_rel(foreignrel);
+	bool		grouped_bridge_cte = false;
 	List	   *fdw_private;
 	List	   *remote_exprs = NIL;
 	List	   *local_exprs = NIL;
@@ -2188,34 +2317,28 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 #endif
 	}
 
-	/*
-	 * Some top-level ordered foreign paths reach GetForeignPlan without a
-	 * UPPERREL_FINAL callback, so opportunistically append LIMIT/OFFSET to the
-	 * remote SQL when the chosen foreign path already satisfies the query order.
-	 * A local Limit node may still remain above the scan, but becomes a safe
-	 * redundant check rather than a performance barrier.
-	 */
-	if (!has_limit &&
-		parse->commandType == CMD_SELECT &&
-		!parse->rowMarks &&
-		!parse->hasTargetSRFs &&
-		parse->limitOption != LIMIT_OPTION_WITH_TIES &&
-		fpinfo != NULL && fpinfo->local_conds == NIL &&
-		outer_plan == NULL &&
-		foreignrel->relids != NULL && root->all_baserels != NULL &&
-		bms_equal(foreignrel->relids, root->all_baserels) &&
-		(root->sort_pathkeys == NIL ||
-		 pathkeys_contained_in(root->sort_pathkeys, best_path->path.pathkeys)) &&
-		is_foreign_expr(root, foreignrel, (Expr *) parse->limitOffset) &&
-		is_foreign_expr(root, foreignrel, (Expr *) parse->limitCount))
-		has_limit = true;
-
 	if (IS_SIMPLE_REL(foreignrel))
 	{
+		if (grouped_bridge)
+		{
+			scan_rte = planner_rt_fetch(foreignrel->relid, root);
+			grouped_bridge_cte = (scan_rte != NULL && scan_rte->rtekind == RTE_CTE);
+
+			if (pg_monetdb_enable_planner_hook_debug)
+				elog(DEBUG1,
+					 "pg_monetdb getplan: grouped_bridge relid=%u rtekind=%s grouped_bridge_cte=%s plan_name=%s",
+					 foreignrel->relid,
+					 scan_rte != NULL ? pg_monetdb_rtekind_name(scan_rte->rtekind) : "<none>",
+					 grouped_bridge_cte ? "true" : "false",
+					 root->plan_name != NULL ? root->plan_name : "<none>");
+		}
+
 		/*
 		 * For base relations, set scan_relid as the relid of the relation.
 		 */
-		scan_relid = grouped_bridge ? 0 : foreignrel->relid;
+		scan_relid = grouped_bridge ?
+			(grouped_bridge_cte ? foreignrel->relid : 0) :
+			foreignrel->relid;
 
 		if (grouped_bridge)
 			fdw_scan_tlist = pg_monetdb_build_grouped_bridge_scan_tlist(root,
@@ -2403,6 +2526,19 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 	 * Build the query string to be sent for execution, and identify
 	 * expressions to be sent as parameters.
 	 */
+	if (pg_monetdb_enable_planner_hook_debug &&
+		(IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel)))
+		elog(DEBUG1,
+			 "pg_monetdb getplan relkind=%s stage=%d plan_tlist_has_agg=%s fdw_scan_tlist_has_agg=%s outer_plan_present=%s local_exprs=%d remote_exprs=%d scan_relid=%u",
+			 IS_UPPER_REL(foreignrel) ? "upper" : "join",
+			 fpinfo != NULL ? fpinfo->stage : -1,
+			 contain_agg_clause((Node *) tlist) ? "true" : "false",
+			 contain_agg_clause((Node *) fdw_scan_tlist) ? "true" : "false",
+			 outer_plan != NULL ? "true" : "false",
+			 list_length(local_exprs),
+			 list_length(remote_exprs),
+			 scan_relid);
+
 	initStringInfo(&sql);
 	deparseSelectStmtForRel(&sql, root, foreignrel, fdw_scan_tlist,
 							remote_exprs, best_path->path.pathkeys,
@@ -2656,6 +2792,7 @@ MonetDB_IterateForeignScan(ForeignScanState *node)
 			if (mapi_close_handle(fsstate->hdl) != MOK)
 				die(fsstate->conn, fsstate->hdl);
 		}
+
 	}
 
 	/*
@@ -5243,6 +5380,16 @@ MonetDB_GetForeignJoinPaths(PlannerInfo *root,
 		return;
 
 	/*
+	 * Only joins whose inputs are already proven foreign-safe can carry FDW
+	 * join state.  The planner hook wrapper may call us for local joins too;
+	 * do not leave a placeholder fpinfo behind for those.
+	 */
+	if (outerrel->fdw_private == NULL || innerrel->fdw_private == NULL ||
+		!((MonetdbFdwRelationInfo *) outerrel->fdw_private)->pushdown_safe ||
+		!((MonetdbFdwRelationInfo *) innerrel->fdw_private)->pushdown_safe)
+		return;
+
+	/*
 	 * This code does not work for joins with lateral references, since those
 	 * must have parameterized paths, which we don't generate yet.
 	 */
@@ -5609,6 +5756,17 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 {
 	MonetdbFdwRelationInfo *fpinfo;
 	bool		single_consumer_nested = false;
+	bool		reused_nested_cte = false;
+
+	if (pg_monetdb_enable_planner_hook_debug)
+		elog(DEBUG1,
+			 "pg_monetdb upper cb entry: stage=%d input_fdw_private=%s input_pushdown_safe=%s output_has_private=%s input_relids=%s",
+			 stage,
+			 input_rel != NULL && input_rel->fdw_private != NULL ? "true" : "false",
+			 input_rel != NULL && input_rel->fdw_private != NULL &&
+			 ((MonetdbFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe ? "true" : "false",
+			 output_rel != NULL && output_rel->fdw_private != NULL ? "true" : "false",
+			 input_rel != NULL && input_rel->relids != NULL ? bmsToString(input_rel->relids) : "<null>");
 
 	/*
 	 * If input rel is not safe to pushdown, then simply return as we cannot
@@ -5627,6 +5785,19 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 
 	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
 		single_consumer_nested = pg_monetdb_is_single_consumer_nested_query(root);
+	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
+		reused_nested_cte = pg_monetdb_is_reused_nested_cte_query(root);
+
+	if (pg_monetdb_enable_planner_hook_debug &&
+		stage == UPPERREL_GROUP_AGG && root->parent_root != NULL)
+		elog(DEBUG1,
+			 "pg_monetdb upper guard: single_consumer=%s reused_cte=%s simple_nested_agg=%s plan_name=%s parent_plan_name=%s input_relids=%s",
+			 single_consumer_nested ? "true" : "false",
+			 reused_nested_cte ? "true" : "false",
+			 pg_monetdb_is_simple_nested_aggregate_subquery(root, input_rel) ? "true" : "false",
+			 root->plan_name != NULL ? root->plan_name : "<none>",
+			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 input_rel != NULL && input_rel->relids != NULL ? bmsToString(input_rel->relids) : "<null>");
 
 	/*
 	 * A plain aggregate on top of a grouped-bridge subquery still needs a
@@ -5640,17 +5811,23 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/*
-	 * Separately planned subqueries/CTEs need their grouping output preserved
-	 * as a local subplan boundary.  Pushing GROUP_AGG here can leave planner
-	 * bookkeeping expecting subplan target entries that the foreign path does
-	 * not expose correctly for materialized consumers.
+	 * Separately planned subqueries/CTEs usually need their grouping output
+	 * preserved as a local subplan boundary.  Pushing GROUP_AGG here can leave
+	 * planner bookkeeping expecting subplan target entries that the foreign
+	 * path does not expose correctly for materialized consumers.
 	 *
 	 * A plain scalar aggregate SubPlan is a narrower case: there is no grouped
 	 * bridge output to preserve, and keeping GROUP_AGG local prevents the inner
 	 * plan from becoming the remote ForeignScan shape that SubPlan inlining and
 	 * remote InitPlan pushdown expect later.
+	 *
+	 * Reused grouped CTE producers are another narrow exception: the shared
+	 * boundary is the CTE itself, so we can still let the producer query build
+	 * a remote grouped upperrel while keeping grouped-bridge and join pushdown
+	 * disabled for the multiple consumers above it.
 	 */
 	if (stage == UPPERREL_GROUP_AGG && root->parent_root != NULL &&
+		!reused_nested_cte &&
 		!single_consumer_nested &&
 		!pg_monetdb_is_simple_nested_aggregate_subquery(root, input_rel))
 		return;
@@ -5699,6 +5876,16 @@ add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	int			width;
 	Cost		startup_cost;
 	Cost		total_cost;
+
+	if (pg_monetdb_enable_planner_hook_debug)
+		elog(DEBUG1,
+			 "pg_monetdb add_grouping: input_pushdown_safe=%s parse_hasAggs=%s parse_groupClause=%s having=%s input_relids=%s grouped_relids=%s",
+			 ifpinfo != NULL && ifpinfo->pushdown_safe ? "true" : "false",
+			 parse->hasAggs ? "true" : "false",
+			 parse->groupClause != NIL ? "true" : "false",
+			 extra != NULL && extra->havingQual != NULL ? "true" : "false",
+			 input_rel != NULL && input_rel->relids != NULL ? bmsToString(input_rel->relids) : "<null>",
+			 grouped_rel != NULL && grouped_rel->relids != NULL ? bmsToString(grouped_rel->relids) : "<null>");
 
 	/* Nothing to be done, if there is no grouping or aggregation required. */
 	if (!parse->groupClause && !parse->groupingSets && !parse->hasAggs &&
@@ -5906,7 +6093,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 	/* Create foreign ordering path */
 	ordered_path = create_foreign_upper_path(root,
-											 input_rel,
+									 ordered_rel,
 											 root->upper_targets[UPPERREL_ORDERED],
 											 rows,
 #if PG_VERSION_NUM >= 180000
@@ -5956,6 +6143,17 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 */
 	if (parse->commandType != CMD_SELECT)
 		return;
+
+#if PG_VERSION_NUM >= 190000
+	/*
+	 * PostgreSQL 19 tightened upper-path targetlist bookkeeping.  Our remote
+	 * LIMIT path still produces an invalid FINAL upper-rel shape there, so keep
+	 * LIMIT local until that path is taught to preserve the required subplan
+	 * target entries.
+	 */
+	if (extra->limit_needed)
+		return;
+#endif
 
 	/*
 	 * No work if there is no FOR UPDATE/SHARE clause and if there is no need
@@ -6030,7 +6228,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				 * EXPLAIN output look cleaner
 				 */
 				final_path = create_foreign_upper_path(root,
-													   path->parent,
+												   final_rel,
 													   path->pathtarget,
 													   path->rows,
 #if PG_VERSION_NUM >= 180000
@@ -6177,7 +6375,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * plan (if any), which makes the EXPLAIN output look cleaner
 	 */
 	final_path = create_foreign_upper_path(root,
-								   input_rel,
+							   final_rel,
 										   root->upper_targets[UPPERREL_FINAL],
 										   rows,
 #if PG_VERSION_NUM >= 180000
@@ -6265,6 +6463,7 @@ make_tuple_from_result_row(MapiHdl res,
 	Datum	   *values;
 	bool	   *nulls;
 	int			field_count;
+	int			row_field_count;
 	int			retrieved_count;
 	ConversionLocation errpos;
 	ErrorContextCallback errcallback;
@@ -6333,7 +6532,18 @@ make_tuple_from_result_row(MapiHdl res,
 	error_context_stack = &errcallback;
 
 	/* fetch next row */
-	if (mapi_fetch_row(res))
+	row_field_count = mapi_fetch_row(res);
+
+	if (row_field_count < 0)
+		elog(ERROR, "MonetDB row fetch returned invalid field count %d", row_field_count);
+
+	if (row_field_count > 0 && retrieved_count > 0 && row_field_count != retrieved_count)
+		elog(ERROR,
+			 "remote row shape mismatch: expected %d columns but MonetDB row returned %d",
+			 retrieved_count,
+			 row_field_count);
+
+	if (row_field_count > 0)
 	{
 		/*
 		 * i indexes columns in the relation, j indexes columns in the PGresult.
@@ -7189,17 +7399,81 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	MonetdbFdwRelationInfo *fpinfo_i;
 	ListCell   *lc;
 	List	   *joinclauses;
+	bool		single_consumer_nested;
+	bool		reused_nested_cte;
+	bool		simple_nested_agg;
+	bool		outer_target_has_agg;
+	bool		inner_target_has_agg;
+	bool		join_target_has_agg;
+
+	single_consumer_nested = pg_monetdb_is_single_consumer_nested_query(root);
+	reused_nested_cte = pg_monetdb_is_reused_nested_cte_query(root);
+	simple_nested_agg = pg_monetdb_is_simple_nested_aggregate_subquery(root,
+											   joinrel);
 
 	/*
-	 * Materialized CTEs and other separately planned subqueries need a stable
-	 * local aggregate boundary above their joins.  Let the core planner build
-	 * that local join+aggregate shape instead of pushing the join down here.
+	 * Only inspect reltarget Aggrefs when the reused-CTE gate below actually
+	 * uses them.  Calling contain_agg_clause() unconditionally is unsafe for
+	 * non-reused-CTE join candidates (e.g. Q18 semi-joins) whose reltargets
+	 * may contain partially-initialized aggregate nodes.
+	 */
+	outer_target_has_agg = reused_nested_cte &&
+		outerrel != NULL && outerrel->reltarget != NULL &&
+		contain_agg_clause((Node *) outerrel->reltarget->exprs);
+	inner_target_has_agg = reused_nested_cte &&
+		innerrel != NULL && innerrel->reltarget != NULL &&
+		contain_agg_clause((Node *) innerrel->reltarget->exprs);
+	join_target_has_agg = reused_nested_cte &&
+		joinrel != NULL && joinrel->reltarget != NULL &&
+		contain_agg_clause((Node *) joinrel->reltarget->exprs);
+
+	if (pg_monetdb_enable_planner_hook_debug && root->parent_root != NULL)
+		elog(DEBUG1,
+			 "pg_monetdb join entry: single_consumer=%s reused_cte=%s simple_nested_agg=%s plan_name=%s parent_plan_name=%s joinrelids=%s",
+			 single_consumer_nested ? "true" : "false",
+			 reused_nested_cte ? "true" : "false",
+			 simple_nested_agg ? "true" : "false",
+			 root->plan_name != NULL ? root->plan_name : "<none>",
+			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 joinrel != NULL && joinrel->relids != NULL ? bmsToString(joinrel->relids) : "<null>");
+
+	if (pg_monetdb_enable_planner_hook_debug && reused_nested_cte)
+	{
+		pg_monetdb_log_rel_target(outerrel, "reused-cte outer");
+		pg_monetdb_log_rel_target(innerrel, "reused-cte inner");
+		pg_monetdb_log_rel_target(joinrel, "reused-cte join");
+		elog(DEBUG1,
+			 "pg_monetdb reused-cte agg gate: outer_has_agg=%s inner_has_agg=%s join_has_agg=%s",
+			 outer_target_has_agg ? "true" : "false",
+			 inner_target_has_agg ? "true" : "false",
+			 join_target_has_agg ? "true" : "false");
+	}
+
+	/*
+	 * Reused/materialized CTEs and other separately planned subqueries need a
+	 * stable local aggregate boundary above their joins.  Let the core planner
+	 * build that local join+aggregate shape instead of pushing the join down
+	 * here.
 	 */
 	if (root->parent_root != NULL &&
 		(root->parse->hasAggs || root->parse->groupClause != NIL) &&
-		!pg_monetdb_is_single_consumer_nested_query(root) &&
-		!pg_monetdb_is_simple_nested_aggregate_subquery(root, joinrel))
-		return false;
+		!single_consumer_nested &&
+		!simple_nested_agg)
+	{
+		if (!reused_nested_cte || outer_target_has_agg || inner_target_has_agg ||
+			join_target_has_agg)
+			return false;
+	}
+
+	if (pg_monetdb_enable_planner_hook_debug && root->parent_root != NULL)
+		elog(DEBUG1,
+			 "pg_monetdb join guard: single_consumer=%s reused_cte=%s simple_nested_agg=%s plan_name=%s parent_plan_name=%s joinrelids=%s",
+			 single_consumer_nested ? "true" : "false",
+			 reused_nested_cte ? "true" : "false",
+			 simple_nested_agg ? "true" : "false",
+			 root->plan_name != NULL ? root->plan_name : "<none>",
+			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 joinrel != NULL && joinrel->relids != NULL ? bmsToString(joinrel->relids) : "<null>");
 
 	/*
 	 * We support pushing down INNER, LEFT, RIGHT, FULL OUTER, SEMI, and ANTI

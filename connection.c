@@ -172,7 +172,6 @@ GetConnection(UserMapping *user, ForeignServer *server)
 		char 		*user_str = NULL;
 		char 		*password = NULL;
 		char 		*dbname = NULL;
-		List	   	*options = NIL;
 		ListCell  	*cell = NULL;
 		MapiHdl hdl = NULL;
 		entry->xact_depth = 0;
@@ -186,10 +185,7 @@ GetConnection(UserMapping *user, ForeignServer *server)
 			GetSysCacheHashValue1(USERMAPPINGOID,
 								ObjectIdGetDatum(user->umid));
 
-		options = list_concat(options, server->options);
-		options = list_concat(options, user->options);
-
-		foreach(cell, options)
+		foreach(cell, server->options)
 		{
 			DefElem    *def = (DefElem *) lfirst(cell);
 
@@ -204,7 +200,22 @@ GetConnection(UserMapping *user, ForeignServer *server)
 			else if (strcmp(def->defname, "dbname") == 0)
 				dbname = defGetString(def);
 		}
-		list_free(options);
+
+		foreach(cell, user->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(cell);
+
+			if (strcmp(def->defname, "host") == 0)
+				host = defGetString(def);
+			else if (strcmp(def->defname, "port") == 0)
+				port = defGetString(def);
+			else if (strcmp(def->defname, "user") == 0)
+				user_str = defGetString(def);
+			else if (strcmp(def->defname, "password") == 0)
+				password = defGetString(def);
+			else if (strcmp(def->defname, "dbname") == 0)
+				dbname = defGetString(def);
+		}
 
 		elog(DEBUG2, "monetdb: host: %s port: %s user: %s password: %s dbname: %s", host, port, user_str, password, dbname);
 		entry->conn = mapi_connect(host, atoi(port), user_str, password, "sql", dbname);
