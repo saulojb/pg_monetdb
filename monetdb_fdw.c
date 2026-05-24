@@ -85,6 +85,13 @@ typedef struct PgMonetdbPlannerTraceContext
 	SubLink    *grouped_any_sublink;
 } PgMonetdbPlannerTraceContext;
 
+typedef struct MonetdbQueryResultState
+{
+	int			current_row;
+	int			num_rows;
+	char	  **rows;
+} MonetdbQueryResultState;
+
 static PlannedStmt *pg_monetdb_planner(Query *parse,
 									  const char *query_string,
 									  int cursorOptions,
@@ -119,6 +126,7 @@ static PlannedStmt *pg_monetdb_plan_with_next(Query *parse,
 #endif
 								 );
 static bool pg_monetdb_find_grouped_any_sublink(Node *node, void *context);
+static ForeignServer *monetdb_get_server_by_name(Name srvname);
 static CommonTableExpr *pg_monetdb_get_cte_for_rte(PlannerInfo *root,
 								 RangeTblEntry *rte);
 static Query *pg_monetdb_get_grouped_query_for_rte(PlannerInfo *root,
@@ -1597,6 +1605,7 @@ typedef struct
  */
 PG_FUNCTION_INFO_V1(monetdb_fdw_handler);
 PG_FUNCTION_INFO_V1(monetdb_execute);
+PG_FUNCTION_INFO_V1(monet_query);
 
 /*
  * FDW callback routines
@@ -7646,6 +7655,104 @@ convert_prep_stmt_params(MonetdbFdwModifyState *fmstate,
 }
 
 /*
+ * Resolve a foreign server name to its ForeignServer catalog entry.
+ */
+static ForeignServer *
+monetdb_get_server_by_name(Name srvname)
+{
+	HeapTuple	tup;
+	Oid			srvId;
+
+	tup = SearchSysCache1(FOREIGNSERVERNAME, NameGetDatum(srvname));
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("server \"%s\" does not exist", NameStr(*srvname))));
+
+	srvId = ((Form_pg_foreign_server) GETSTRUCT(tup))->oid;
+	ReleaseSysCache(tup);
+
+	return GetForeignServer(srvId);
+}
+
+/*
+ * monet_query
+ * 		Execute a statement on a foreign server and return raw result rows.
+ */
+PGDLLEXPORT Datum
+monet_query(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	MonetdbQueryResultState *query_state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext oldcontext;
+		Name		srvname = PG_GETARG_NAME(0);
+		char	   *stmt = text_to_cstring(PG_GETARG_TEXT_PP(1));
+		ForeignServer *server;
+		UserMapping *user;
+		Mapi		conn;
+		MapiHdl		hdl;
+		char	   *line;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		query_state = palloc0(sizeof(MonetdbQueryResultState));
+		server = monetdb_get_server_by_name(srvname);
+		user = GetUserMapping(GetUserId(), server->serverid);
+		conn = GetConnection(user, server);
+
+		elog(DEBUG2, "monetdb_fdw remote query is: %s", stmt);
+		hdl = mapi_query(conn, stmt);
+		if (hdl == NULL || mapi_error(conn))
+			die(conn, hdl);
+
+		while ((line = mapi_fetch_line(hdl)) != NULL)
+		{
+			char	   *row_copy;
+
+			if (*line == '%')
+				continue;
+
+			if (query_state->num_rows == 0)
+				query_state->rows = palloc(sizeof(char *));
+			else
+				query_state->rows = repalloc(query_state->rows,
+										 sizeof(char *) * (query_state->num_rows + 1));
+
+			row_copy = MemoryContextStrdup(funcctx->multi_call_memory_ctx, line);
+			query_state->rows[query_state->num_rows] = row_copy;
+			query_state->num_rows++;
+		}
+
+		if (mapi_error(conn))
+			error_info(conn, hdl);
+		if (mapi_close_handle(hdl) != MOK)
+			error_info(conn, hdl);
+
+		ReleaseConnection(conn);
+		pfree(stmt);
+
+		funcctx->user_fctx = query_state;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	query_state = (MonetdbQueryResultState *) funcctx->user_fctx;
+
+	if (query_state->current_row < query_state->num_rows)
+	{
+		char	   *row = query_state->rows[query_state->current_row++];
+
+		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(row));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+/*
  * monetdb_execute
  * 		Execute a statement that returns no result values on a foreign server.
  */
@@ -7654,54 +7761,18 @@ monetdb_execute(PG_FUNCTION_ARGS)
 {
 	Name 		srvname = PG_GETARG_NAME(0);
 	char 		*stmt   = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	Oid 		srvId = InvalidOid;
 	int 		fields = 0;
 	char 		*line = NULL;
 	Mapi 	   	conn;
 	MapiHdl 	hdl;
 	UserMapping *user = NULL;
-	char 		*host = NULL;        
-	char 		*port = NULL;         
-	char 		*user_str = NULL;          
-	char 		*password = NULL;         
-	char 		*dbname = NULL;
-	List	   	*options = NIL;
-	ListCell  	*cell = NULL;
 	ForeignServer *server = NULL;
 	StringInfoData msg;
 
-	HeapTuple tup = SearchSysCacheCopy1(FOREIGNSERVERNAME, NameGetDatum(srvname));
-	if (!HeapTupleIsValid(tup))
-		ereport(ERROR,
-			(errcode(ERRCODE_UNDEFINED_OBJECT),
-			errmsg("server \"%s\" does not exist", NameStr(*srvname))));
-
-	srvId = ((Form_pg_foreign_server)GETSTRUCT(tup))->oid;
-	user = GetUserMapping(GetUserId(), srvId);
-	server = GetForeignServer(srvId);
-	options = list_concat(options, server->options);
-	options = list_concat(options, user->options);
-
-	foreach(cell, options)
-	{
-		DefElem    *def = (DefElem *) lfirst(cell);
-
-		if (strcmp(def->defname, "host") == 0)
-			host = defGetString(def);
-		else if (strcmp(def->defname, "port") == 0)
-			port = defGetString(def);
-		else if (strcmp(def->defname, "user") == 0)
-			user_str = defGetString(def);
-		else if (strcmp(def->defname, "password") == 0)
-			password = defGetString(def);
-		else if (strcmp(def->defname, "dbname") == 0)
-			dbname = defGetString(def);
-	}
-	list_free(options);
-	
-	elog(DEBUG2, "monetdb: host: %s port: %s user: %s password: %s dbname: %s", host, port, user_str, password, dbname);
+	server = monetdb_get_server_by_name(srvname);
+	user = GetUserMapping(GetUserId(), server->serverid);
 	elog(DEBUG2, "monetdb_fdw remote query is: %s", stmt);
-	conn = mapi_connect(host, atoi(port), user_str, password, "sql", dbname);
+	conn = GetConnection(user, server);
 	if ((hdl = mapi_query(conn, stmt)) == NULL || mapi_error(conn))
 		die(conn, hdl);
 
@@ -7729,18 +7800,16 @@ monetdb_execute(PG_FUNCTION_ARGS)
 
 	/* If there are data returned, let's output these data. */
 	if (msg.len)
-	{
 		elog(INFO, "\n%s", msg.data);
-		pfree(msg.data);
-	}
+	pfree(msg.data);
 
 	/* clear */
-	heap_freetuple(tup);
+	pfree(stmt);
 	if (mapi_error(conn))
 		error_info(conn, hdl);
 	if (mapi_close_handle(hdl) != MOK)
 		error_info(conn, hdl);
-	mapi_destroy(conn);
+	ReleaseConnection(conn);
 	PG_RETURN_VOID();
 }
 

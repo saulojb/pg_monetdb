@@ -87,6 +87,13 @@ name,age
  
 (1 row)
 
+SELECT * FROM monet_query('foreign_server', $$SELECT * FROM emp$$);
+  monet_query     
+---------------------
+ [ "John",	23	]
+ [ "Mary",	22	]
+(2 rows)
+
 -- test explain
 -- EXPLAIN (COSTS OFF) SELECT * FROM emp;
 EXPLAIN (COSTS OFF) INSERT INTO emp VALUES('Mary test', 21);

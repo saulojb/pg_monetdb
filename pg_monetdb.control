@@ -1,5 +1,5 @@
 # pg_monetdb extension
 comment = 'foreign-data wrapper for remote MonetDB databases'
-default_version = '1.0'
+default_version = '1.3'
 module_pathname = '$libdir/pg_monetdb'
 relocatable = true

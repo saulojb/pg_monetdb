@@ -32,7 +32,9 @@ PG_CPPFLAGS  += -I"$(MONETDB_INCLUDE)"
 SHLIB_LINK   += -L"$(MAPI_LIBDIR)" -l"$(MAPI_LIBNAME)" -Wl,-rpath,"$(MAPI_LIBDIR)"
 
 EXTENSION = pg_monetdb
-DATA = pg_monetdb--1.0.sql
+DATA = pg_monetdb--1.0.sql pg_monetdb--1.1.sql pg_monetdb--1.2.sql \
+	pg_monetdb--1.3.sql pg_monetdb--1.0--1.1.sql \
+	pg_monetdb--1.1--1.2.sql pg_monetdb--1.2--1.3.sql
 
 REGRESS = pg_monetdb type_support
 

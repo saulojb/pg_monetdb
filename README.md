@@ -87,6 +87,21 @@ OPTIONS (schema_name 'zm', table_name 'emp');
 SELECT count(*) FROM emp;
 ```
 
+* For ad hoc remote SQL, `monet_query` returns raw text rows, while the helper variants can parse simple scalar result sets into arrays or JSON objects.
+
+```sql
+SELECT * FROM monet_query('foreign_server', $$SELECT name, age FROM emp$$);
+
+SELECT * FROM monet_query_to_array('foreign_server', $$SELECT name, age FROM emp$$);
+
+SELECT *
+FROM monet_query_to_jsonb(
+        'foreign_server',
+        $$SELECT name, age FROM emp$$,
+        ARRAY['name', 'age']
+);
+```
+
 * NOTE: you can IMPORT FOREIGN SCHEMA to create foreign table for convenient
 
 ```sql

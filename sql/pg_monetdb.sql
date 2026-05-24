@@ -49,6 +49,14 @@ INSERT INTO emp VALUES('Mary', 22);
 -- test select
 SELECT * FROM emp;
 SELECT monetdb_execute('foreign_server', $$SELECT * FROM emp$$);
+SELECT * FROM monet_query('foreign_server', $$SELECT * FROM emp$$);
+SELECT * FROM monet_query_to_array('foreign_server', $$SELECT * FROM emp$$);
+SELECT *
+FROM monet_query_to_jsonb(
+     'foreign_server',
+     $$SELECT * FROM emp$$,
+     ARRAY['name', 'age']
+);
 
 -- test explain
 -- EXPLAIN (COSTS OFF) SELECT * FROM emp;
