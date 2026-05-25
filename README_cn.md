@@ -2,6 +2,10 @@
 
 ## pg_monetdb
 
+<p align="center">
+  <img src="docs/images/capa.png" alt="pg_monetdb cover" width="960">
+</p>
+
 pg_monetdb 是 monetdb_fdw 的一个分支，重点增强了面向 TPC-H 和 TPC-DS 风格分析型查询的 pushdown 能力。
 
 这个分支建立在优秀的 oracle_fdw (https://github.com/laurenz/oracle_fdw.git) 和 postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html) 项目之上。
