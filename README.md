@@ -10,14 +10,37 @@ It also includes support for MonetDB `HUGEINT`, MonetDB `BLOB`, and partial `INT
 
 ### Benchmark
 
-Checked-in local TPC-H totals from a real PostgreSQL heap run on schema `pg` and the matching `pg_monetdb` run on schema `monet`, both on PostgreSQL 19:
+Checked-in local TPC-H timings from a real PostgreSQL heap run on schema `pg` and the matching `pg_monetdb` run on schema `monet`, both on PostgreSQL 19:
 
-| Engine            | Artifact                       | Total TPC-H Time | Total TPC-H Time (s) |
-| ----------------- | ------------------------------ | ---------------- | -------------------- |
-| PostgreSQL heap   | `tpch_regression_heap_pg19.tsv`  | 13500.269 ms     | 13.500 s             |
-| `pg_monetdb`      | `tpch_regression_monet_pg19.tsv` | 1362.447 ms      | 1.362 s              |
+| Query | PostgreSQL heap | `pg_monetdb` | Pushdown |
+| ----- | --------------- | ------------ | -------- |
+| Query 1 | 1272.074 ms | 139.990 ms | Full |
+| Query 2 | 298.228 ms | 9.162 ms | Partial |
+| Query 3 | 322.203 ms | 41.508 ms | Partial |
+| Query 4 | 183.436 ms | 21.230 ms | Full |
+| Query 5 | 559.401 ms | 23.874 ms | Full |
+| Query 6 | 152.712 ms | 9.087 ms | Full |
+| Query 7 | 2448.717 ms | 36.381 ms | Full |
+| Query 8 | 246.125 ms | 35.699 ms | Full |
+| Query 9 | 1645.422 ms | 68.392 ms | Full |
+| Query 10 | 346.119 ms | 206.652 ms | Full |
+| Query 11 | 109.532 ms | 39.043 ms | Partial |
+| Query 12 | 278.782 ms | 11.945 ms | Full |
+| Query 13 | 525.866 ms | 61.930 ms | Full |
+| Query 14 | 123.599 ms | 4.649 ms | Full |
+| Query 15 | 474.821 ms | 36.892 ms | Partial |
+| Query 16 | 182.510 ms | 55.098 ms | Full |
+| Query 17 | 596.631 ms | 28.372 ms | Full |
+| Query 18 | 1888.438 ms | 39.790 ms | Full |
+| Query 19 | 43.837 ms | 43.812 ms | Full |
+| Query 20 | 253.526 ms | 350.296 ms | Partial |
+| Query 21 | 1474.114 ms | 75.057 ms | Partial |
+| Query 22 | 74.176 ms | 23.588 ms | Partial |
+| Total | 13500.269 ms | 1362.447 ms | - |
 
 In this checked-in PostgreSQL 19 benchmark, `pg_monetdb` finishes the TPC-H total about `9.91x` faster than the local heap baseline, a reduction of about `89.9%`.
+
+`Pushdown` is marked as `Full` when the current PostgreSQL 19 artifact is a plain `FS` plan and `Partial` when the checked-in shape still includes `LOCAL_*`, `INITPLAN`, or `MIXED` work.
 
 These totals are reproducible with `scripts/load_pg18_heap_into_pg19.sh`, `scripts/run_tpch_all_sql.sh`, and `scripts/benchmark_tpch_schema.sh`.
 
