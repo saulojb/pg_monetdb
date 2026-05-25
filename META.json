@@ -1,7 +1,7 @@
 {
   "name": "pg_monetdb",
-  "abstract": "Foreign-data wrapper for remote MonetDB databases",
-  "description": "pg_monetdb is a PostgreSQL FDW extension for querying and modifying data stored in remote MonetDB servers. The distribution ships the extension control and upgrade scripts, C implementation, and documentation needed to build, install, and use the FDW through PGXS.",
+  "abstract": "MonetDB foreign-data wrapper with stronger analytical pushdown",
+  "description": "pg_monetdb is a PostgreSQL FDW extension and monetdb_fdw fork for querying and modifying data stored in remote MonetDB servers. This distribution ships the extension control and upgrade scripts, C implementation, and documentation needed to build, install, and use the FDW through PGXS, with current support for stronger analytical pushdown plus MonetDB HUGEINT, BLOB, and validated interval-family round trips.",
   "version": "1.4.0",
   "maintainer": [
     "saulo jose benvenutti <saulojb@gmail.com>"
@@ -14,13 +14,13 @@
       "file": "pg_monetdb--1.4.sql",
       "docfile": "README.md",
       "version": "1.4.0",
-      "abstract": "Foreign-data wrapper for remote MonetDB databases"
+      "abstract": "MonetDB foreign-data wrapper with stronger analytical pushdown"
     }
   },
   "prereqs": {
     "runtime": {
       "requires": {
-        "PostgreSQL": "14.0.0"
+        "PostgreSQL": "15.0.0"
       }
     }
   },
@@ -43,9 +43,12 @@
   "release_status": "stable",
   "tags": [
     "fdw",
+    "foreign-data-wrapper",
     "monetdb",
+    "postgresql",
+    "pushdown",
     "analytics",
-    "columnar",
-    "foreign-data-wrapper"
+    "tpc-h",
+    "tpc-ds"
   ]
 }

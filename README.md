@@ -1,4 +1,4 @@
-[Chinese README](README_cn.md)
+[Chinese README](README_cn.md) | [Brazilian Portuguese README](README_pt_BR.md)
 
 ## pg_monetdb
 
@@ -7,6 +7,12 @@ pg_monetdb is a fork of monetdb_fdw focused on stronger pushdown for analytical 
 This fork builds on the excellent oracle_fdw (https://github.com/laurenz/oracle_fdw.git) and postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html) projects.
 
 It also includes support for MonetDB `HUGEINT`, MonetDB `BLOB`, and partial `INTERVAL` round trips. The fully validated interval families are `interval month`, `interval day`, and `interval second`; MonetDB qualifiers backed by `sec_interval` still import into PostgreSQL as `interval second`, so the original qualifier is not preserved yet.
+
+### Upstream Acknowledgement
+
+Upstream repository: https://github.com/HaloTech-Co-Ltd/MonetDB_fdw
+
+Special thanks to the `monetdb_fdw` maintainers and contributors for the upstream project this fork builds on.
 
 ### Benchmark
 
@@ -69,12 +75,20 @@ Those artifacts are the checked-in reference for the current cross-version valid
 
 * RHEL 8/9, CentOS 8/9, Ubuntu
 * Halo 1.0.14, 1.0.16
-* PostgreSQL 14, 15, 16, 17, 18, 19
+* PostgreSQL 15, 16, 17, 18, 19
 * MonetDB 11.56
 
 ### Cookbook
 
 #### Installation
+
+MonetDB quick install: https://www.monetdb.org/easy-setup/
+
+If MonetDB was installed from standard distribution packages, a common default is:
+
+```sh
+export MONETDB_HOME=/usr
+```
 
 * Build as PGXS
 
