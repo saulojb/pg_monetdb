@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	139.990	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q02	OK	9.162	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q03	OK	41.508	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q04	OK	21.230	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q05	OK	23.874	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q06	OK	9.087	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q07	OK	36.381	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q08	OK	35.699	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q09	OK	68.392	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q10	OK	206.652	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q11	OK	39.043	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q12	OK	11.945	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q13	OK	61.930	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q14	OK	4.649	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q15	OK	36.892	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q16	OK	55.098	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q17	OK	28.372	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q18	OK	39.790	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q19	OK	43.812	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q20	OK	350.296	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q21	OK	75.057	BENCH	full all.sql run on PostgreSQL 19 schema monet
+Q22	OK	23.588	BENCH	full all.sql run on PostgreSQL 19 schema monet

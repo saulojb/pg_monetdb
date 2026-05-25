@@ -1,0 +1,23 @@
+query	status	time_ms	shape	notes
+Q01	OK	1272.074	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q02	OK	298.228	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q03	OK	322.203	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q04	OK	183.436	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q05	OK	559.401	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q06	OK	152.712	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q07	OK	2448.717	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q08	OK	246.125	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q09	OK	1645.422	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q10	OK	346.119	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q11	OK	109.532	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q12	OK	278.782	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q13	OK	525.866	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q14	OK	123.599	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q15	OK	474.821	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q16	OK	182.510	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q17	OK	596.631	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q18	OK	1888.438	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q19	OK	43.837	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q20	OK	253.526	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q21	OK	1474.114	BENCH	full all.sql run on PostgreSQL 19 schema pg
+Q22	OK	74.176	BENCH	full all.sql run on PostgreSQL 19 schema pg

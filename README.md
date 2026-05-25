@@ -1,14 +1,50 @@
-[简体中文版](README_cn.md)
+[Chinese README](README_cn.md)
 
 ## pg_monetdb
 
-pg_monetdb is a PostgreSQL extension based on Foreign Data Wrapper (FDW) technology, which can enhance PostgreSQL analytical capabilities.
+pg_monetdb is a fork of monetdb_fdw focused on stronger pushdown for analytical query shapes derived from TPC-H and TPC-DS-style workloads.
 
-The work based on the excellent oracle_fdw (https://github.com/laurenz/oracle_fdw.git) & postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html) projects.
+This fork builds on the excellent oracle_fdw (https://github.com/laurenz/oracle_fdw.git) and postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html) projects.
+
+It also includes support for MonetDB `HUGEINT`, MonetDB `BLOB`, and partial `INTERVAL` round trips. The fully validated interval families are `interval month`, `interval day`, and `interval second`; MonetDB qualifiers backed by `sec_interval` still import into PostgreSQL as `interval second`, so the original qualifier is not preserved yet.
+
+### Benchmark
+
+Checked-in local TPC-H totals from a real PostgreSQL heap run on schema `pg` and the matching `pg_monetdb` run on schema `monet`, both on PostgreSQL 19:
+
+| Engine            | Artifact                       | Total TPC-H Time | Total TPC-H Time (s) |
+| ----------------- | ------------------------------ | ---------------- | -------------------- |
+| PostgreSQL heap   | `tpch_regression_heap_pg19.tsv`  | 13500.269 ms     | 13.500 s             |
+| `pg_monetdb`      | `tpch_regression_monet_pg19.tsv` | 1362.447 ms      | 1.362 s              |
+
+In this checked-in PostgreSQL 19 benchmark, `pg_monetdb` finishes the TPC-H total about `9.91x` faster than the local heap baseline, a reduction of about `89.9%`.
+
+These totals are reproducible with `scripts/load_pg18_heap_into_pg19.sh`, `scripts/run_tpch_all_sql.sh`, and `scripts/benchmark_tpch_schema.sh`.
+
+Important note: `tpch_regression_baseline.tsv` is still kept in the repository as a historical FDW artifact, but it is not a PostgreSQL heap-only benchmark and should not be read as a direct heap-vs-FDW comparison.
+
+Benchmark environment used for the checked-in PostgreSQL 19 totals above:
+
+* OS: Ubuntu 26.04 LTS (Resolute Raccoon), kernel `7.0.0-15-generic`
+* CPU: AMD Ryzen 7 5800H with Radeon Graphics, 16 threads
+* Memory: 38.5 GiB RAM
+* PostgreSQL used for the benchmark total above: `postgres (PostgreSQL) 19devel (Ubuntu 19~~devel-3~20260525.0815.g0b8fa5fd37b.pgdg26.04+1)`
+
+### Validation Matrix
+
+The repository also carries versioned TPC-H regression artifacts for PostgreSQL 15 through 19:
+
+* `tpch_regression_pg15.tsv`
+* `tpch_regression_pg16.tsv`
+* `tpch_regression_pg17.tsv`
+* `tpch_regression_pg18.tsv`
+* `tpch_regression_pg19.tsv`
+
+Those artifacts are the checked-in reference for the current cross-version validation matrix, covering PostgreSQL 15, 16, 17, 18, and 19.
 
 ### Supported OS & Database Versions
 
-* RHEL 8/9, CentOS 8/9，Ubuntu
+* RHEL 8/9, CentOS 8/9, Ubuntu
 * Halo 1.0.14, 1.0.16
 * PostgreSQL 14, 15, 16, 17, 18, 19
 * MonetDB 11.56
@@ -127,9 +163,9 @@ IMPORT FOREIGN SCHEMA "zm" limit to (emp) from server foreign_server into public
 | ---------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------- |
 | CHAR                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | VARCHAR                      | Y         | Ref PostgreSQL Doc                                                                                                        |
-| TEXT                         | Y         | Ref PostgreSQL Doc. TEXT(x) is not supported，<br />TEXT(x) will transform to VARCHAR(x) when imported into PostgreSQL    |
-| CLOB                         | Y         | Base type is TEXT. CLOB(x) is not supported，<br />CLOB(x) will transform to VARCHAR(x) when imported into PostgreSQL     |
-| STRING                       | Y         | Base type is TEXT，STRING(x) is not supported，<br />STRING(x) will transform to VARCHAR(x) when imported into PostgreSQL |
+| TEXT                         | Y         | Ref PostgreSQL Doc. TEXT(x) is not supported,<br />TEXT(x) will transform to VARCHAR(x) when imported into PostgreSQL    |
+| CLOB                         | Y         | Base type is TEXT. CLOB(x) is not supported,<br />CLOB(x) will transform to VARCHAR(x) when imported into PostgreSQL     |
+| STRING                       | Y         | Base type is TEXT, STRING(x) is not supported,<br />STRING(x) will transform to VARCHAR(x) when imported into PostgreSQL |
 | BLOB                         | Y         | Base type is `bytea`; domains over `bytea` such as `blob` are supported                                                  |
 | BOOL                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | TINYINT                      | Y         | Base type is smallint                                                                                                     |
