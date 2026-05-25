@@ -76,3 +76,16 @@ FROM retidos;
 - Contexto: a variante `JOIN LATERAL (SELECT 0.2 * AVG(...) ...) aq ON outer_col < aq.threshold` ainda fica local, mas a forma escalar equivalente em `WHERE outer_col < (SELECT 0.2 * AVG(...) ...)` ja pushda como um unico `Foreign Scan`.
 - Estado atual seguro: usar a reescrita documentada em `sql/lateral_scalar_rewrite_manual.sql` e no README para obter pushdown sem mexer em joins parametrizados.
 - Direcao futura: reconhecer planner-side esse padrao especifico de `INNER JOIN LATERAL` escalar e normaliza-lo para a forma correlacionada antes da classificacao entre `remote_conds` e `local_conds`.
+
+### 8. Consolidar suporte documentado a `BLOB` / `bytea`
+
+- Status: aberto para acabamento/documentacao adicional
+- Contexto: o codigo atual ja trata `bytea`/`BLOB` em leitura, escrita e predicados parametrizados, mas ainda vale revisar se queremos expor um dominio/helper `blob` de forma mais explicita na superficie SQL e nos scripts de validacao.
+- Direcao: manter README coerente com o suporte atual e avaliar se um dominio utilitario traz ganho real ou so duplica o mapeamento de `bytea`.
+
+### 9. Estudar estrategia para `HUGEINT`
+
+- Status: estudo futuro
+- Contexto: MonetDB `HUGEINT` ainda nao tem mapeamento nativo seguro no PostgreSQL suportado por esta extensao.
+- Direcao de investigacao: comparar pelo menos tres caminhos antes de implementar algo definitivo: tipo custom PostgreSQL, extensao externa de inteiros 128-bit, ou degradacao controlada para `numeric`.
+- Guard-rail: qualquer suporte futuro precisa preservar round-trip correto, operadores/comparacoes remotas consistentes e importacao de schema sem ambiguidade de tipo.

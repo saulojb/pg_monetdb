@@ -130,7 +130,7 @@ IMPORT FOREIGN SCHEMA "zm" limit to (emp) from server foreign_server into public
 | TEXT                         | Y         | Ref PostgreSQL Doc. TEXT(x) is not supported，<br />TEXT(x) will transform to VARCHAR(x) when imported into PostgreSQL    |
 | CLOB                         | Y         | Base type is TEXT. CLOB(x) is not supported，<br />CLOB(x) will transform to VARCHAR(x) when imported into PostgreSQL     |
 | STRING                       | Y         | Base type is TEXT，STRING(x) is not supported，<br />STRING(x) will transform to VARCHAR(x) when imported into PostgreSQL |
-| BLOB                         | N         |                                                                                                                           |
+| BLOB                         | Y         | Base type is `bytea`; domains over `bytea` such as `blob` are supported                                                  |
 | BOOL                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | TINYINT                      | Y         | Base type is smallint                                                                                                     |
 | SMALLINT                     | Y         | Ref PostgreSQL Doc                                                                                                        |
@@ -157,6 +157,8 @@ Test case please reference [type\_support.sql](./sql/type_support.sql)
 #### Manual Validation
 
 For planner validation against an existing PostgreSQL database with imported TPC-H foreign tables in schema `monet`, see [materialized_cte_manual.sql](./sql/materialized_cte_manual.sql).
+
+Important note: MonetDB does not accept the ANSI `MATERIALIZED` / `NOT MATERIALIZED` CTE syntax. Because of that, pg_monetdb cannot push down a PostgreSQL `WITH ... AS MATERIALIZED (...)` clause as equivalent remote SQL. The validated safe behavior is to keep the materialization boundary local in PostgreSQL.
 
 Typical invocation:
 
@@ -189,7 +191,7 @@ sudo -n -u postgres env PGOPTIONS='-c session_preload_libraries=pg_monetdb' \
         psql -X -p 5433 -d monet_test -f sql/lateral_scalar_rewrite_manual.sql
 ```
 
-This is an experimental workflow for validation on the test branch. Without session preload, the first FDW query in a backend can still miss the rewrite and keep the original `JOIN LATERAL` shape local.
+This is an experimental workflow. Without session preload, the first FDW query in a backend can still miss the rewrite and keep the original `JOIN LATERAL` shape local. Explicit `LOAD 'pg_monetdb'` before the first FDW query is also sufficient to activate the same planner path in that backend session.
 
 Example rewrite:
 
