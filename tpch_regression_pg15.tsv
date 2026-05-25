@@ -1,23 +1,23 @@
 query	status	time_ms	shape	notes
-Q01	OK	157.677	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q02	OK	9.206	FS+LOCAL_SORT	full all.sql run on PostgreSQL 15; top-N sort/limit wrapper above remote Foreign Scan
-Q03	OK	25.415	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q04	OK	91.700	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 15; EXISTS pushed remote, local aggregate/sort remains
-Q05	OK	26.590	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q06	OK	8.301	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q07	OK	54.404	FS+LOCAL_AGG+LOCAL_SORT	full all.sql run on PostgreSQL 15; remote join/filter with local aggregate/sort on EXTRACT expression
-Q08	OK	32.864	FS+LOCAL_SORT	matches baseline shape; local sort above remote Foreign Scan
-Q09	OK	99.456	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q10	OK	269.973	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q11	OK	8.754	FS+INITPLAN	matches baseline shape; remote Foreign Scan plus remote InitPlan
-Q12	OK	78.491	FS+LOCAL_AGG+LOCAL_SORT	baseline had FS+LOCAL_AGG; PostgreSQL 15 keeps a local sort wrapper
-Q13	ISSUE	260.031	FS+LOCAL_AGG+LOCAL_SORT	matches known issue class; remote grouped scan feeds local aggregate/sort
-Q14	OK	5.080	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q15	OK	56.274	MIXED	CREATE VIEW / EXPLAIN / DROP VIEW completed; mixed local and remote execution
-Q16	OK	52.186	FS	matches baseline shape; NOT IN subquery pushdown active
-Q17	OK	26.914	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q18	OK	370.745	FS	matches baseline shape; grouped-subquery join pushdown active
-Q19	OK	44.531	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
-Q20	OK	320.155	FS+LOCAL_SORT	matches baseline shape; remote query with local top sort
-Q21	OK	84.041	FS+LOCAL_LIMIT	remote JOIN_ANTI rewrite still active; PostgreSQL 15 keeps a local Limit wrapper
-Q22	OK	30.003	FS+INITPLAN+LOCAL_AGG+LOCAL_SORT+LOCAL_LIMIT	remote InitPlan and remote NOT EXISTS feed local aggregate; PostgreSQL 15 also keeps local sort/limit wrapper
+Q01	OK	155.665	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q02	OK	8.303	FS+LOCAL_SORT+LOCAL_LIMIT	full all.sql run on PostgreSQL 15 after global remote LIMIT guard; local top-N wrapper above remote Foreign Scan
+Q03	OK	41.909	FS+LOCAL_SORT+LOCAL_LIMIT	full all.sql run on PostgreSQL 15 after global remote LIMIT guard; local top-N wrapper avoids the final-upper pathkey failure
+Q04	OK	23.530	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q05	OK	23.028	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q06	OK	7.897	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q07	OK	36.992	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q08	OK	34.336	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q09	OK	69.502	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q10	OK	210.473	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q11	OK	41.350	FS+INITPLAN	full all.sql run on PostgreSQL 15; remote Foreign Scan plus remote InitPlan
+Q12	OK	11.589	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q13	OK	62.562	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q14	OK	4.415	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q15	OK	38.182	MIXED	full all.sql run on PostgreSQL 15; local sort over remote view-expanded scan and InitPlan
+Q16	OK	57.914	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q17	OK	29.054	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q18	OK	50.926	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q19	OK	46.396	FS	full all.sql run on PostgreSQL 15; single Foreign Scan
+Q20	OK	315.329	FS+LOCAL_SORT	full all.sql run on PostgreSQL 15; local sort above remote Foreign Scan
+Q21	OK	72.684	FS+LOCAL_LIMIT	full all.sql run on PostgreSQL 15; local Limit above remote Foreign Scan
+Q22	OK	21.805	FS+INITPLAN+LOCAL_LIMIT	full all.sql run on PostgreSQL 15; remote InitPlan plus local Limit wrapper

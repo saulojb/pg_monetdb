@@ -3,14 +3,22 @@
  * monetdb_fdw.c
  *		  Foreign-data wrapper for remote MonetDB databases
  *
+ * pg_monetdb is a PostgreSQL foreign data wrapper for MonetDB,
+ * derived from prior monetdb_fdw and PostgreSQL FDW work, with extended
+ * and rewritten functionality.
+ *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following copyright notices:
  *
  * Portions Copyright (c) 2025-2026, Halo Tech Co.,Ltd.
  * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, Saulo Jose Benvenutti
  *
  * Author: zengman <zengman@halodbtech.com>
+ * Additional contributions by Saulo Jose Benvenutti <saulojb@gmail.com>
  * 
  * IDENTIFICATION
  *		  monetdb_fdw.c
@@ -148,6 +156,8 @@ static bool pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root);
 static bool pg_monetdb_is_reused_nested_cte_query(PlannerInfo *root);
 static bool pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
 									 RelOptInfo *input_rel);
+static bool pg_monetdb_is_simple_grouped_bridge_regroup_query(PlannerInfo *root,
+					 RelOptInfo *input_rel);
 static void pg_monetdb_attach_grouped_subquery_fpinfo(RelOptInfo *rel,
 									   Index rti,
 									   RangeTblEntry *rte,
@@ -178,6 +188,7 @@ static const char *pg_monetdb_rtekind_name(RTEKind rtekind);
 static const char *pg_monetdb_sublink_name(SubLinkType sublink_type);
 static const char *pg_monetdb_upper_stage_name(UpperRelationKind stage);
 static double pg_monetdb_instr_time_ms(instr_time *start_time);
+static const char *pg_monetdb_plan_name(PlannerInfo *root);
 
 /* Default CPU cost to start up a foreign query. */
 #define DEFAULT_FDW_STARTUP_COST	100.0
@@ -319,6 +330,19 @@ pg_monetdb_instr_time_ms(instr_time *start_time)
 	INSTR_TIME_SET_CURRENT(elapsed);
 	INSTR_TIME_SUBTRACT(elapsed, *start_time);
 	return INSTR_TIME_GET_MILLISEC(elapsed);
+}
+
+static const char *
+pg_monetdb_plan_name(PlannerInfo *root)
+{
+#if PG_VERSION_NUM >= 190000
+	if (root != NULL && root->plan_name != NULL)
+		return root->plan_name;
+#else
+	(void) root;
+#endif
+
+	return NULL;
 }
 
 static PlannedStmt *
@@ -789,7 +813,7 @@ pg_monetdb_query_is_fully_foreign(Query *query, Oid *server_oid_inout)
 			case RTE_CTE:
 			case RTE_JOIN:
 			case RTE_RESULT:
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 180000
 			case RTE_GROUP:
 #endif
 				/* Structural entries – not leaf table refs */
@@ -1005,10 +1029,16 @@ pg_monetdb_build_wholequery_plan(Query *parse, const char *sql, Oid server_oid)
 	fscan->scan.scanrelid = 0;	/* 0 = join/upper style → uses fdw_scan_tlist */
 	fscan->operation = CMD_SELECT;
 	fscan->resultRelation = 0;
+
+#if PG_VERSION_NUM >= 160000
 	fscan->checkAsUser = InvalidOid;
+#endif
 	fscan->fs_server = server_oid;
 	fscan->fs_relids = base_relids;
+
+#if PG_VERSION_NUM >= 160000
 	fscan->fs_base_relids = base_relids;
+#endif
 	fscan->fdw_exprs = NIL;
 	fscan->fdw_private = fdw_private;
 	fscan->fdw_scan_tlist = fdw_scan_tlist;
@@ -1027,10 +1057,12 @@ pg_monetdb_build_wholequery_plan(Query *parse, const char *sql, Oid server_oid)
 	ps->parallelModeNeeded = false;
 	ps->planTree = (Plan *) fscan;
 	ps->rtable = parse->rtable;
-#if PG_VERSION_NUM >= 160000
+#if PG_VERSION_NUM >= 190000
+	ps->permInfos = parse->rteperminfos;
+	ps->resultRelationRelids = NULL;
+#elif PG_VERSION_NUM >= 160000
 	ps->permInfos = parse->rteperminfos;
 #endif
-	ps->resultRelationRelids = NULL;
 	ps->appendRelations = NIL;
 	ps->subplans = NIL;
 	ps->rewindPlanIDs = NULL;
@@ -1128,7 +1160,7 @@ pg_monetdb_is_reused_nested_cte_query(PlannerInfo *root)
 		root->parent_root->parse == NULL)
 		return false;
 
-	plan_name = root->plan_name;
+	plan_name = pg_monetdb_plan_name(root);
 	if (plan_name != NULL)
 	{
 		foreach(lc, root->parent_root->parse->cteList)
@@ -1172,6 +1204,61 @@ pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
 
 	if (root->parse->setOperations != NULL || root->parse->hasWindowFuncs)
 		return false;
+
+	return true;
+}
+
+static bool
+pg_monetdb_is_simple_grouped_bridge_regroup_query(PlannerInfo *root,
+							  RelOptInfo *input_rel)
+{
+	ListCell   *lc;
+
+	if (root == NULL || root->parse == NULL || input_rel == NULL)
+		return false;
+
+	if (!pg_monetdb_is_grouped_bridge_rel(input_rel))
+		return false;
+
+	if (!root->parse->hasAggs || root->parse->groupClause == NIL ||
+		root->parse->groupingSets != NIL || root->hasHavingQual)
+		return false;
+
+	if (root->parse->setOperations != NULL || root->parse->hasWindowFuncs)
+		return false;
+
+	if (pg_monetdb_fromnode_has_join((Node *) root->parse->jointree))
+		return false;
+
+	foreach(lc, root->parse->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+
+		if (IsA(tle->expr, Var))
+			continue;
+
+		if (IsA(tle->expr, Aggref))
+		{
+			Aggref	   *aggref = castNode(Aggref, tle->expr);
+
+			if (aggref->aggstar)
+				continue;
+		}
+
+		return false;
+	}
+
+	foreach(lc, root->parse->groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->parse->targetList);
+
+		if (tle == NULL || !IsA(tle->expr, Var))
+			return false;
+	}
 
 	return true;
 }
@@ -1380,10 +1467,12 @@ pg_monetdb_rtekind_name(RTEKind rtekind)
 			return "RTE_CTE";
 		case RTE_NAMEDTUPLESTORE:
 			return "RTE_NAMEDTUPLESTORE";
+#if PG_VERSION_NUM >= 190000
 		case RTE_GRAPH_TABLE:
 			return "RTE_GRAPH_TABLE";
+#endif
 
-#if PG_VERSION_NUM >= 180000
+		#if PG_VERSION_NUM >= 180000
 		case RTE_GROUP:
 			return "RTE_GROUP";
 #endif
@@ -2704,7 +2793,7 @@ MonetDB_GetForeignPlan(PlannerInfo *root,
 					 foreignrel->relid,
 					 scan_rte != NULL ? pg_monetdb_rtekind_name(scan_rte->rtekind) : "<none>",
 					 grouped_bridge_cte ? "true" : "false",
-					 root->plan_name != NULL ? root->plan_name : "<none>");
+					 pg_monetdb_plan_name(root) != NULL ? pg_monetdb_plan_name(root) : "<none>");
 		}
 
 		/*
@@ -4961,14 +5050,11 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 	else
 	{
 		/*
-		 * The default extra cost seems too large for foreign-grouping cases;
-		 * add 1/4th of that default.
+		 * When ORDER BY is already satisfied by the grouping pathkeys, avoid a
+		 * heuristic surcharge.  It can dominate tiny upper-rel costs and make
+		 * the planner prefer a local sort + local aggregate over a valid remote
+		 * grouped path.
 		 */
-		double		sort_multiplier = 1.0 + (DEFAULT_FDW_SORT_MULTIPLIER
-											 - 1.0) * 0.25;
-
-		*p_startup_cost *= sort_multiplier;
-		*p_run_cost *= sort_multiplier;
 	}
 }
 
@@ -6233,8 +6319,8 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 			 single_consumer_nested ? "true" : "false",
 			 reused_nested_cte ? "true" : "false",
 			 pg_monetdb_is_simple_nested_aggregate_subquery(root, input_rel) ? "true" : "false",
-			 root->plan_name != NULL ? root->plan_name : "<none>",
-			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 pg_monetdb_plan_name(root) != NULL ? pg_monetdb_plan_name(root) : "<none>",
+			 pg_monetdb_plan_name(root->parent_root) != NULL ? pg_monetdb_plan_name(root->parent_root) : "<none>",
 			 input_rel != NULL && input_rel->relids != NULL ? bmsToString(input_rel->relids) : "<null>");
 
 	/*
@@ -6245,7 +6331,7 @@ MonetDB_GetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (stage == UPPERREL_GROUP_AGG &&
 		pg_monetdb_is_grouped_bridge_rel(input_rel) &&
-		!pg_monetdb_fromnode_has_join((Node *) root->parse->jointree))
+		!pg_monetdb_is_simple_grouped_bridge_regroup_query(root, input_rel))
 		return;
 
 	/*
@@ -6582,16 +6668,15 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	if (parse->commandType != CMD_SELECT)
 		return;
 
-#if PG_VERSION_NUM >= 190000
 	/*
-	 * PostgreSQL 19 tightened upper-path targetlist bookkeeping.  Our remote
-	 * LIMIT path still produces an invalid FINAL upper-rel shape there, so keep
-	 * LIMIT local until that path is taught to preserve the required subplan
-	 * target entries.
+	 * Our current remote LIMIT/final-upper-rel shape is not safe across the
+	 * supported PostgreSQL releases: PG15-18 can fail with "could not find
+	 * pathkey item to sort", while PG19 tightened upper-path targetlist
+	 * bookkeeping further. Keep LIMIT local until the final-upper path
+	 * preserves the required sort and target entries across all releases.
 	 */
 	if (extra->limit_needed)
 		return;
-#endif
 
 	/*
 	 * No work if there is no FOR UPDATE/SHARE clause and if there is no need
@@ -7942,8 +8027,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			 single_consumer_nested ? "true" : "false",
 			 reused_nested_cte ? "true" : "false",
 			 simple_nested_agg ? "true" : "false",
-			 root->plan_name != NULL ? root->plan_name : "<none>",
-			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 pg_monetdb_plan_name(root) != NULL ? pg_monetdb_plan_name(root) : "<none>",
+			 pg_monetdb_plan_name(root->parent_root) != NULL ? pg_monetdb_plan_name(root->parent_root) : "<none>",
 			 joinrel != NULL && joinrel->relids != NULL ? bmsToString(joinrel->relids) : "<null>");
 
 	if (pg_monetdb_enable_planner_hook_debug && reused_nested_cte)
@@ -7980,8 +8065,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			 single_consumer_nested ? "true" : "false",
 			 reused_nested_cte ? "true" : "false",
 			 simple_nested_agg ? "true" : "false",
-			 root->plan_name != NULL ? root->plan_name : "<none>",
-			 root->parent_root != NULL && root->parent_root->plan_name != NULL ? root->parent_root->plan_name : "<none>",
+			 pg_monetdb_plan_name(root) != NULL ? pg_monetdb_plan_name(root) : "<none>",
+			 pg_monetdb_plan_name(root->parent_root) != NULL ? pg_monetdb_plan_name(root->parent_root) : "<none>",
 			 joinrel != NULL && joinrel->relids != NULL ? bmsToString(joinrel->relids) : "<null>");
 
 	/*

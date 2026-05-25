@@ -13,15 +13,23 @@
  * functions or functions using nonportable collations.  Those considerations
  * need not be accounted for here.
  *
+ * pg_monetdb is a PostgreSQL foreign data wrapper for MonetDB,
+ * derived from prior monetdb_fdw and PostgreSQL FDW work, with extended
+ * and rewritten functionality.
+ *
  * 
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following copyright notices:
  *
  * Portions Copyright (c) 2025-2026, Halo Tech Co.,Ltd.
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, Saulo Jose Benvenutti
  *
  * Author: zengman <zengman@halodbtech.com>
+ * Additional contributions by Saulo Jose Benvenutti <saulojb@gmail.com>
  * 
  * IDENTIFICATION
  *	  shippable.c

@@ -1,20 +1,28 @@
 /*-------------------------------------------------------------------------
  *
  * deparse.c
- *		  Query deparser for monetdb_fdw
+ *		  Query deparser for pg_monetdb
  *
  * This file includes functions that examine query WHERE clauses to see
  * whether they're safe to send to the remote server for execution.
  *
+ * pg_monetdb is a PostgreSQL foreign data wrapper for MonetDB,
+ * derived from prior monetdb_fdw and PostgreSQL FDW work, with extended
+ * and rewritten functionality.
+ *
  * 
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ *
+ * This file incorporates work covered by the following copyright notices:
  *
  * Portions Copyright (c) 2025-2026, Halo Tech Co.,Ltd.
  * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, Saulo Jose Benvenutti
  * 
  * Author: zengman <zengman@halodbtech.com>
+ * Additional contributions by Saulo Jose Benvenutti <saulojb@gmail.com>
  *
  * IDENTIFICATION
  *		  deparse.c
@@ -3937,11 +3945,16 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 		case INTERVALOID:
 			{
 				Interval   *interval = DatumGetIntervalP(node->constvalue);
+				bool		finite_interval = true;
 
-				if (!INTERVAL_NOT_FINITE(interval) &&
+#if PG_VERSION_NUM >= 170000
+				finite_interval = !INTERVAL_NOT_FINITE(interval);
+#endif
+
+				if (finite_interval &&
 					interval->day == 0 && interval->time == 0)
 					appendStringInfo(buf, "INTERVAL '%d' MONTH", interval->month);
-				else if (!INTERVAL_NOT_FINITE(interval) &&
+				else if (finite_interval &&
 						 interval->month == 0 && interval->time == 0)
 					appendStringInfo(buf, "INTERVAL '%d' DAY", interval->day);
 				else
@@ -5710,12 +5723,16 @@ resolve_group_vars_mutator(Node *node, ResolveGroupVarsCtx *ctx)
 	if (IsA(node, Var))
 	{
 		Var			  *var = (Var *) node;
+
+#if PG_VERSION_NUM >= 180000
 		RangeTblEntry *rte;
+#endif
 
 		if (var->varlevelsup == 0 &&
 			var->varno >= 1 &&
 			var->varno < ctx->root->simple_rel_array_size)
 		{
+#if PG_VERSION_NUM >= 180000
 			rte = ctx->root->simple_rte_array[var->varno];
 			if (rte != NULL &&
 				rte->rtekind == RTE_GROUP &&
@@ -5731,6 +5748,7 @@ resolve_group_vars_mutator(Node *node, ResolveGroupVarsCtx *ctx)
 					(Node *) list_nth(rte->groupexprs, var->varattno - 1),
 					ctx);
 			}
+#endif
 		}
 		return (Node *) copyObject(node);
 	}
@@ -5971,6 +5989,7 @@ deparse_query_body_for_monetdb(StringInfo buf, Query *query)
 			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
 			TargetEntry		*tle = get_sortgroupclause_tle(sgc,
 														   query->targetList);
+			bool			reverse_sort = false;
 
 			if (!first)
 				appendStringInfoString(buf, ", ");
@@ -5978,7 +5997,22 @@ deparse_query_body_for_monetdb(StringInfo buf, Query *query)
 
 			deparse_resolved(tle->expr, &context);
 
-			if (sgc->reverse_sort)
+			#if PG_VERSION_NUM >= 180000
+			reverse_sort = sgc->reverse_sort;
+			#else
+			if (OidIsValid(sgc->sortop))
+			{
+				Oid			 sortcoltype;
+				TypeCacheEntry *typentry;
+
+				sortcoltype = exprType((Node *) tle->expr);
+				typentry = lookup_type_cache(sortcoltype,
+									 TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+				reverse_sort = (sgc->sortop == typentry->gt_opr);
+			}
+			#endif
+
+			if (reverse_sort)
 				appendStringInfoString(buf, " DESC");
 			if (sgc->nulls_first)
 				appendStringInfoString(buf, " NULLS FIRST");
