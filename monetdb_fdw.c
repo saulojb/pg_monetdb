@@ -29,6 +29,7 @@
 
 #include <mapi.h>
 #include <limits.h>
+#include <math.h>
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -75,6 +76,7 @@
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 #include "utils/ruleutils.h"
+#include "utils/timestamp.h"
 
 /* Forward declaration for ExplainState - defined in commands/explain_state.h */
 typedef struct ExplainState ExplainState;
@@ -2029,6 +2031,14 @@ typedef struct ConversionLocation
 	ForeignScanState *fsstate;	/* plan node being processed, or NULL */
 } ConversionLocation;
 
+typedef enum PgMonetdbIntervalFamily
+{
+	PG_MONETDB_INTERVAL_FAMILY_NONE,
+	PG_MONETDB_INTERVAL_FAMILY_MONTHS,
+	PG_MONETDB_INTERVAL_FAMILY_DAYS,
+	PG_MONETDB_INTERVAL_FAMILY_SECONDS
+} PgMonetdbIntervalFamily;
+
 /* Callback argument for ec_member_matches_foreign */
 typedef struct
 {
@@ -2190,6 +2200,14 @@ static char *build_parameterized_query(const char *query_template,
 									   Oid *param_types,
 									   List *param_exprs,
 									   ExprContext *econtext);
+static PgMonetdbIntervalFamily pg_monetdb_get_interval_family(Oid type,
+										int32 typmod);
+static char *pg_monetdb_format_interval_parameter(Datum value,
+								 Oid type,
+								 int32 typmod);
+static char *pg_monetdb_normalize_interval_result(char *valstr,
+							 Oid type,
+							 int32 typmod);
 static HeapTuple make_tuple_from_result_row(MapiHdl res,
 											int row,
 											Relation rel,
@@ -5650,6 +5668,132 @@ monetdb_convert_binary_parameter(Datum value, Oid type)
 	return hex;
 }
 
+static PgMonetdbIntervalFamily
+pg_monetdb_get_interval_family(Oid type, int32 typmod)
+{
+	char   *typename;
+	PgMonetdbIntervalFamily family = PG_MONETDB_INTERVAL_FAMILY_NONE;
+
+	if (getBaseType(type) != INTERVALOID)
+		return PG_MONETDB_INTERVAL_FAMILY_NONE;
+
+	typename = format_type_with_typemod(type, typmod);
+
+	if (strcmp(typename, "interval year") == 0 ||
+		strcmp(typename, "interval year to month") == 0 ||
+		strcmp(typename, "interval month") == 0)
+		family = PG_MONETDB_INTERVAL_FAMILY_MONTHS;
+	else if (strcmp(typename, "interval day") == 0)
+		family = PG_MONETDB_INTERVAL_FAMILY_DAYS;
+	else if (strcmp(typename, "interval day to hour") == 0 ||
+			 strcmp(typename, "interval day to minute") == 0 ||
+			 strcmp(typename, "interval day to second") == 0 ||
+			 strcmp(typename, "interval hour") == 0 ||
+			 strcmp(typename, "interval hour to minute") == 0 ||
+			 strcmp(typename, "interval hour to second") == 0 ||
+			 strcmp(typename, "interval minute") == 0 ||
+			 strcmp(typename, "interval minute to second") == 0 ||
+			 strcmp(typename, "interval second") == 0)
+		family = PG_MONETDB_INTERVAL_FAMILY_SECONDS;
+
+	pfree(typename);
+	return family;
+}
+
+static char *
+pg_monetdb_format_interval_parameter(Datum value, Oid type, int32 typmod)
+{
+	Interval   *interval;
+	PgMonetdbIntervalFamily family;
+	int64		total_usecs;
+	int64		total_millis;
+	int64		seconds;
+	int64		millis;
+	int64		days;
+	char	   *seconds_text;
+
+	family = pg_monetdb_get_interval_family(type, typmod);
+	if (family == PG_MONETDB_INTERVAL_FAMILY_NONE)
+		return NULL;
+
+	interval = DatumGetIntervalP(value);
+
+	switch (family)
+	{
+		case PG_MONETDB_INTERVAL_FAMILY_MONTHS:
+			return psprintf("%d", interval->month);
+
+		case PG_MONETDB_INTERVAL_FAMILY_DAYS:
+			total_usecs = interval->time + ((int64) interval->day * USECS_PER_DAY);
+			days = total_usecs / USECS_PER_DAY;
+			return psprintf("%lld", (long long) days);
+
+		case PG_MONETDB_INTERVAL_FAMILY_SECONDS:
+			total_usecs = interval->time + ((int64) interval->day * USECS_PER_DAY);
+			if (total_usecs < 0)
+				total_millis = -(((-total_usecs) + 500) / 1000);
+			else
+				total_millis = (total_usecs + 500) / 1000;
+
+			seconds = total_millis / 1000;
+			millis = llabs(total_millis % 1000);
+			if (millis == 0)
+				seconds_text = psprintf("%lld", (long long) seconds);
+			else
+				seconds_text = psprintf("%lld.%03lld",
+					(long long) seconds,
+					(long long) millis);
+
+			return seconds_text;
+
+		case PG_MONETDB_INTERVAL_FAMILY_NONE:
+			break;
+	}
+
+	return NULL;
+}
+
+static char *
+pg_monetdb_normalize_interval_result(char *valstr, Oid type, int32 typmod)
+{
+	PgMonetdbIntervalFamily family;
+	char	   *endptr;
+	long double numeric_value;
+
+	if (valstr == NULL || getBaseType(type) != INTERVALOID)
+		return valstr;
+
+	family = pg_monetdb_get_interval_family(type, typmod);
+	if (family == PG_MONETDB_INTERVAL_FAMILY_NONE)
+		return valstr;
+
+	numeric_value = strtold(valstr, &endptr);
+	while (endptr != NULL && *endptr != '\0' && isspace((unsigned char) *endptr))
+		endptr++;
+	if (endptr == valstr || *endptr != '\0')
+		return valstr;
+
+	switch (family)
+	{
+		case PG_MONETDB_INTERVAL_FAMILY_MONTHS:
+			return psprintf("%s mons", valstr);
+
+		case PG_MONETDB_INTERVAL_FAMILY_DAYS:
+				if (fmodl(numeric_value, 86400.0L) == 0.0L)
+					return psprintf("%lld days",
+						(long long) (numeric_value / 86400.0L));
+				return psprintf("%.15Lg days", numeric_value / 86400.0L);
+
+		case PG_MONETDB_INTERVAL_FAMILY_SECONDS:
+			return psprintf("%s seconds", valstr);
+
+		case PG_MONETDB_INTERVAL_FAMILY_NONE:
+			break;
+	}
+
+	return valstr;
+}
+
 /*
  * build_parameterized_query
  *		Evaluate runtime parameters and return a copy of query_template with
@@ -7443,6 +7587,7 @@ make_tuple_from_result_row(MapiHdl res,
 				if (valstr != NULL)
 				{
 					Oid coltype = TupleDescAttr(tupdesc, i - 1)->atttypid;
+					int32 coltypmod = TupleDescAttr(tupdesc, i - 1)->atttypmod;
 					if (getBaseType(coltype) == BYTEAOID)
 					{
 						char *hex = palloc(strlen(valstr) + 3);
@@ -7451,6 +7596,10 @@ make_tuple_from_result_row(MapiHdl res,
 						strcpy(hex + 2, valstr);
 						valstr = hex;
 					}
+					else if (getBaseType(coltype) == INTERVALOID)
+						valstr = pg_monetdb_normalize_interval_result(valstr,
+												   coltype,
+												   coltypmod);
 				}
 
 				/* Apply the input function even to nulls, to support domains */
@@ -8034,6 +8183,10 @@ convert_prep_stmt_params(MonetdbFdwModifyState *fmstate,
 					 * There are some types of results that are not recognized by MonetDB,
 					 * and we need to make simple changes to achieve the purpose
 					 */
+					if (val == NULL && getBaseType(attr->atttypid) == INTERVALOID)
+						val = pg_monetdb_format_interval_parameter(value,
+											   attr->atttypid,
+											   attr->atttypmod);
 					if (val == NULL)
 						val = OutputFunctionCall(&fmstate->p_flinfo[j], value);
 					if (attr->atttypid == BOOLOID)

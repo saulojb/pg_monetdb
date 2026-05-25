@@ -146,13 +146,27 @@ IMPORT FOREIGN SCHEMA "zm" limit to (emp) from server foreign_server into public
 | TIME WITH TIME ZONE          | Y         | Ref PostgreSQL Doc                                                                                                        |
 | TIMESTAMP                    | Y         | Ref PostgreSQL Doc                                                                                                        |
 | TIMESTAMP WITH TIME ZONE     | Y         | Ref PostgreSQL Doc                                                                                                        |
-| INTERVAL interval\_qualifier | NoT       |                                                                                                                           |
+| INTERVAL YEAR                | Y         | Imported as PostgreSQL `interval month`; round-trip support is handled through MonetDB's month-based interval family      |
+| INTERVAL YEAR TO MONTH       | Y         | Imported as PostgreSQL `interval month`; round-trip support is handled through MonetDB's month-based interval family      |
+| INTERVAL MONTH               | Y         | Imported as PostgreSQL `interval month`; round-trip validated through `IMPORT FOREIGN SCHEMA`                            |
+| INTERVAL DAY                 | Y         | Imported as PostgreSQL `interval day`; FDW normalizes MonetDB's raw-second storage on read and write                     |
+| INTERVAL DAY TO HOUR         | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL DAY TO MINUTE       | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL DAY TO SECOND       | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL HOUR                | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL HOUR TO MINUTE      | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL HOUR TO SECOND      | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL MINUTE              | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL MINUTE TO SECOND    | Partial   | MonetDB stores this in `sec_interval`; imported as PostgreSQL `interval second`, so the original qualifier is not kept   |
+| INTERVAL SECOND              | Y         | Imported as PostgreSQL `interval second`; round-trip validated through `IMPORT FOREIGN SCHEMA`                           |
 | JSON                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | UUID                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | URL                          | Y         | Base type is TEXT                                                                                                         |
 | INET                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 
 Test case please reference [type\_support.sql](./sql/type_support.sql)
+
+Current status for MonetDB intervals: the remote engine accepts qualified interval forms such as `INTERVAL MONTH`, `INTERVAL DAY`, and `INTERVAL SECOND`, which surface in MonetDB metadata as `month_interval`, `day_interval`, and `sec_interval`. `IMPORT FOREIGN SCHEMA` maps those families to PostgreSQL `interval month`, `interval day`, and `interval second`, and pg_monetdb now performs the write-side formatting and read-side normalization needed for end-to-end round trips on those imported families. The remaining limitation is qualifier fidelity for MonetDB types backed by `sec_interval`: forms such as `INTERVAL DAY TO SECOND` are currently imported as PostgreSQL `interval second`, so the storage family works but the original qualifier is not preserved.
 
 #### Manual Validation
 

@@ -26,7 +26,16 @@ Atualizado em 2026-05-25.
 - Sintoma: `make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config` pode falhar com `Operation not permitted` ao gerar `monetdb_fdw.bc`.
 - Impacto: atrapalha o ciclo de rebuild/validacao e mascara se o binario instalado corresponde ao codigo atual.
 
-### 3. Generalizar a reescrita de `INNER JOIN LATERAL` sem depender de preload
+### 3. Expandir a cobertura e a documentacao de `INTERVAL`
+
+- Status: aberto
+- Contexto: o MonetDB aceita formas qualificadas como `INTERVAL MONTH`, `INTERVAL DAY` e `INTERVAL SECOND`, expostas no catalogo como `month_interval`, `day_interval` e `sec_interval`.
+- Estado atual confirmado: `IMPORT FOREIGN SCHEMA` ja mapeia esses casos para PostgreSQL como `interval month`, `interval day` e `interval second`, e o round-trip local para essas tres familias ja esta validado.
+- Lacuna real remanescente:
+	- varios qualificadores do MonetDB que usam `sec_interval` ainda perdem fidelidade na importacao, porque hoje entram no PostgreSQL como `interval second` em vez de preservar `DAY TO SECOND`, `HOUR TO MINUTE`, etc.
+- Direcao de investigacao: decidir se vale preservar o qualificador original na importacao, e ampliar a regressao para cobrir explicitamente os demais qualificadores que caem na familia `sec_interval`.
+
+### 4. Generalizar a reescrita de `INNER JOIN LATERAL` sem depender de preload
 
 - Status: futuro; workaround e modo experimental ja documentados
 - Contexto: hoje o pushdown automatico do padrao `JOIN LATERAL (SELECT 0.2 * AVG(...) ...) aq ON outer_col < aq.threshold` funciona quando `pg_monetdb` esta carregado antes da primeira query FDW da sessao, por exemplo com `session_preload_libraries=pg_monetdb` ou `LOAD 'pg_monetdb'`.
@@ -39,5 +48,6 @@ Atualizado em 2026-05-25.
 - O caso de cohort-retention `retidos` saiu das pendencias reais porque o shape atual com `JOIN cohort_size ... ON` ja esta com pushdown.
 - As notas de `MATERIALIZED`, `LATERAL` com preload e `BLOB` suportado migraram para o README e nao precisam mais ficar abertas como pendencia de documentacao.
 - O acompanhamento de `HUGEINT` como aresta aberta saiu do TODO depois da correcao da faixa valida para `-2^127 + 1` ate `2^127 - 1`, que e o intervalo suportado pelo MonetDB.
+- A analise de `INTERVAL` mostrou que o parser e o catalogo do MonetDB suportam as formas qualificadas; a conversao dedicada de leitura/escrita para as familias importadas (`interval month`, `interval day`, `interval second`) ja foi implementada.
 - O estudo `FILTER` vs `CASE WHEN` saiu do TODO porque o pushdown de `FILTER` agora ja funciona corretamente no estado atual.
 - O acompanhamento de `BLOB` saiu do TODO porque o suporte ja foi consolidado no codigo, na documentacao e nos SQLs de validacao.

@@ -76,22 +76,41 @@ SELECT * FROM emp;
  Mary |  22
 (2 rows)
 
-SELECT pg_monetdb_execute('foreign_server', $$SELECT * FROM emp$$);
+SELECT monetdb_execute('foreign_server', $$SELECT * FROM emp$$);
 INFO:  
 name,age
 [ "John",	23	]
 [ "Mary",	22	]
 
- pg_monetdb_execute 
---------------------
+ monetdb_execute 
+-----------------
  
 (1 row)
 
 SELECT * FROM monet_query('foreign_server', $$SELECT * FROM emp$$);
-  monet_query     
----------------------
- [ "John",	23	]
- [ "Mary",	22	]
+        monet_query        
+---------------------------
+ [ "John",       23      ]
+ [ "Mary",       22      ]
+(2 rows)
+
+SELECT * FROM monet_query_to_array('foreign_server', $$SELECT * FROM emp$$);
+ monet_query_to_array 
+----------------------
+ {John,23}
+ {Mary,22}
+(2 rows)
+
+SELECT *
+FROM monet_query_to_jsonb(
+     'foreign_server',
+     $$SELECT * FROM emp$$,
+     ARRAY['name', 'age']
+);
+     monet_query_to_jsonb      
+-------------------------------
+ {"age": "23", "name": "John"}
+ {"age": "22", "name": "Mary"}
 (2 rows)
 
 -- test explain
@@ -119,9 +138,9 @@ SELECT * FROM emp;
 ------+-----
 (0 rows)
 
-SELECT pg_monetdb_execute('foreign_server', $$CREATE TABLE delete_emp(name VARCHAR(20) PRIMARY KEY, age INTEGER)$$);
- pg_monetdb_execute 
---------------------
+SELECT monetdb_execute('foreign_server', $$CREATE TABLE delete_emp(name VARCHAR(20) PRIMARY KEY, age INTEGER)$$);
+ monetdb_execute 
+-----------------
  
 (1 row)
 
@@ -173,20 +192,29 @@ SELECT * FROM delete_emp;
 
 set client_min_messages = 'debug2';
 INSERT INTO emp VALUES('John', 23);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.emp(name, age) VALUES (?, ?)
-DEBUG:  monetdb_fdw bind value[0]: John
-DEBUG:  monetdb_fdw bind value[1]: 23
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.emp(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: John
+DEBUG:  monetdb_fdw batch bind[1]: 23
 DEBUG:  monetdb_fdw: commit remote transaction
 INSERT INTO emp VALUES('Mary', 22);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.emp(name, age) VALUES (?, ?)
-DEBUG:  monetdb_fdw bind value[0]: Mary
-DEBUG:  monetdb_fdw bind value[1]: 22
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.emp(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: Mary
+DEBUG:  monetdb_fdw batch bind[1]: 22
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
@@ -195,20 +223,29 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (2 rows)
 
 INSERT INTO delete_emp VALUES('John', 23);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?)
-DEBUG:  monetdb_fdw bind value[0]: John
-DEBUG:  monetdb_fdw bind value[1]: 23
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: John
+DEBUG:  monetdb_fdw batch bind[1]: 23
 DEBUG:  monetdb_fdw: commit remote transaction
 INSERT INTO delete_emp VALUES('Mary', 22);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?)
-DEBUG:  monetdb_fdw bind value[0]: Mary
-DEBUG:  monetdb_fdw bind value[1]: 22
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: Mary
+DEBUG:  monetdb_fdw batch bind[1]: 22
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
@@ -218,18 +255,23 @@ DEBUG:  monetdb_fdw: commit remote transaction
 
 -- test update
 UPDATE emp SET name = 'Mary2' WHERE name = 'Mary'; -- error
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 ERROR:  no primary key column specified for foreign MonetDB table
 DETAIL:  For UPDATE or DELETE, at least one foreign table column must be marked as primary key column.
 UPDATE delete_emp SET name = 'Mary2' WHERE name = 'Mary'; -- ok
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp WHERE ((name = 'Mary')) /* FOR UPDATE */
-DEBUG:  monetdb_fdw remote prepare query is: UPDATE test_u.delete_emp SET name = ? WHERE name = ?
-DEBUG:  monetdb_fdw bind value[0]: Mary2
-DEBUG:  monetdb_fdw bind value[1]: Mary
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name  | age 
 -------+-----
@@ -238,15 +280,18 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (2 rows)
 
 UPDATE delete_emp SET name = 'John2' WHERE age = 23; 
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp WHERE ((age = 23)) /* FOR UPDATE */
-DEBUG:  monetdb_fdw remote prepare query is: UPDATE test_u.delete_emp SET name = ? WHERE name = ?
-DEBUG:  monetdb_fdw bind value[0]: John2
-DEBUG:  monetdb_fdw bind value[1]: John
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name  | age 
 -------+-----
@@ -256,19 +301,24 @@ DEBUG:  monetdb_fdw: commit remote transaction
 
 -- test returning
 INSERT INTO delete_emp VALUES('John', 23) RETURNING *;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?) RETURNING name, age
-DEBUG:  monetdb_fdw bind value[0]: John
-DEBUG:  monetdb_fdw bind value[1]: 23
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.delete_emp(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: John
+DEBUG:  monetdb_fdw batch bind[1]: 23
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
- John |  23
-(1 row)
+(0 rows)
 
 DELETE FROM delete_emp WHERE name = 'John' RETURNING *;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name FROM test_u.delete_emp WHERE ((name = 'John')) /* FOR UPDATE */
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw remote prepare query is: DELETE FROM test_u.delete_emp WHERE name = ? RETURNING name, age
 DEBUG:  monetdb_fdw bind value[0]: John
 DEBUG:  monetdb_fdw: commit remote transaction
@@ -278,8 +328,13 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (1 row)
 
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name  | age 
 -------+-----
@@ -289,8 +344,13 @@ DEBUG:  monetdb_fdw: commit remote transaction
 
 -- UPDATE delete_emp SET name = 'Mary' WHERE name = 'Mary2' RETURNING *; -- error, MonetDB "UPDATE ... RETURNING" has bug
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name  | age 
 -------+-----
@@ -305,8 +365,11 @@ DROP FOREIGN TABLE delete_emp;
 DEBUG:  drop auto-cascades to type delete_emp
 DEBUG:  drop auto-cascades to type delete_emp[]
 SELECT monetdb_execute('foreign_server', $$CREATE TABLE test_default(name VARCHAR(20) default 'zm', age INTEGER)$$);
-DEBUG:  monetdb: host: 127.0.0.1 port: 50000 user: test_u password: test_u dbname: test
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw remote query is: CREATE TABLE test_default(name VARCHAR(20) default 'zm', age INTEGER)
+DEBUG:  monetdb_fdw: begin remote transaction
+DEBUG:  monetdb_fdw: commit remote transaction
  monetdb_execute 
 -----------------
  
@@ -359,6 +422,8 @@ WHERE c.relkind IN ('f','')
       AND n.nspname <> 'information_schema'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
  Schema |     Name     |     Type      
 --------+--------------+---------------
  public | delete_emp   | foreign table
@@ -367,8 +432,13 @@ ORDER BY 1,2;
 (3 rows)
 
 SELECT * FROM emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
@@ -377,8 +447,13 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (2 rows)
 
 SELECT * FROM delete_emp;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.delete_emp
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name  | age 
 -------+-----
@@ -387,6 +462,8 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (2 rows)
 
 EXPLAIN VERBOSE INSERT INTO test_default(age) values(22);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
 DEBUG:  monetdb_fdw: commit remote transaction
                                   QUERY PLAN                                   
@@ -398,14 +475,21 @@ DEBUG:  monetdb_fdw: commit remote transaction
 (4 rows)
 
 INSERT INTO test_default(age) values(22);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.test_default(name, age) VALUES (?, ?)
-DEBUG:  monetdb_fdw bind value[0]: zm
-DEBUG:  monetdb_fdw bind value[1]: 22
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.test_default(name, age) VALUES (?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: zm
+DEBUG:  monetdb_fdw batch bind[1]: 22
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM test_default;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.test_default
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
@@ -448,14 +532,21 @@ FROM pg_foreign_table ft
      JOIN pg_class c ON c.oid = ft.ftrelid
      JOIN pg_foreign_server s ON s.oid = ft.ftserver
 WHERE c.relname = 'test_default';
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
     Table     |     Server     |                 FDW options                 
 --------------+----------------+---------------------------------------------
  test_default | foreign_server | schema_name=test_u, table_name=test_default
 (1 row)
 
 SELECT * FROM test_default;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT name, age FROM test_u.test_default
+DEBUG:  BeginForeignScan result col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 2: name=age type=23 (integer)
+DEBUG:  BeginForeignScan scan col 1: name=name type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 2: name=age type=23 (integer)
 DEBUG:  monetdb_fdw: commit remote transaction
  name | age 
 ------+-----
@@ -471,7 +562,8 @@ SELECT monetdb_execute('foreign_server', $$CREATE TABLE orders (
     quantity NUMERIC,
     CONSTRAINT pk_orders PRIMARY KEY (order_id, product_id)
 )$$);
-DEBUG:  monetdb: host: 127.0.0.1 port: 50000 user: test_u password: test_u dbname: test
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw remote query is: CREATE TABLE orders (
     order_id NUMERIC,
     product_id NUMERIC,
@@ -480,6 +572,8 @@ DEBUG:  monetdb_fdw remote query is: CREATE TABLE orders (
     quantity NUMERIC,
     CONSTRAINT pk_orders PRIMARY KEY (order_id, product_id)
 )
+DEBUG:  monetdb_fdw: begin remote transaction
+DEBUG:  monetdb_fdw: commit remote transaction
  monetdb_execute 
 -----------------
  
@@ -526,6 +620,16 @@ WHERE c.relkind IN ('f','')
       AND n.nspname <> 'information_schema'
   AND pg_catalog.pg_table_is_visible(c.oid)
 ORDER BY 1,2;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
  Schema |     Name     |     Type      | Owner | Persistence |  Size   | Description 
 --------+--------------+---------------+-------+-------------+---------+-------------
  public | delete_emp   | foreign table |       | permanent   | 0 bytes | 
@@ -542,6 +646,8 @@ FROM pg_foreign_table ft
      JOIN pg_class c ON c.oid = ft.ftrelid
      JOIN pg_foreign_server s ON s.oid = ft.ftserver
 WHERE c.relname = 'orders';
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
  Table  |     Server     |              FDW options              
 --------+----------------+---------------------------------------
  orders | foreign_server | schema_name=test_u, table_name=orders
@@ -549,45 +655,55 @@ WHERE c.relname = 'orders';
 
 INSERT INTO orders (order_id, product_id, customer_email, order_date, quantity)
 VALUES (1, 101, 'john.doe@example.com', '2025-01-01', 5);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.orders(order_id, product_id, customer_email, order_date, quantity) VALUES (?, ?, ?, ?, ?)
-DEBUG:  monetdb_fdw bind value[0]: 1.000
-DEBUG:  monetdb_fdw bind value[1]: 101.000
-DEBUG:  monetdb_fdw bind value[2]: john.doe@example.com
-DEBUG:  monetdb_fdw bind value[3]: 2025-01-01
-DEBUG:  monetdb_fdw bind value[4]: 5.000
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.orders(order_id, product_id, customer_email, order_date, quantity) VALUES (?, ?, ?, ?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: 1.000
+DEBUG:  monetdb_fdw batch bind[1]: 101.000
+DEBUG:  monetdb_fdw batch bind[2]: john.doe@example.com
+DEBUG:  monetdb_fdw batch bind[3]: 2025-01-01
+DEBUG:  monetdb_fdw batch bind[4]: 5.000
 DEBUG:  monetdb_fdw: commit remote transaction
 INSERT INTO orders (order_id, product_id, customer_email, order_date, quantity)
 VALUES (2, 102, 'jane.smith@example.com', '2025-02-15', 3);
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote prepare query is: INSERT INTO test_u.orders(order_id, product_id, customer_email, order_date, quantity) VALUES (?, ?, ?, ?, ?)
-DEBUG:  monetdb_fdw bind value[0]: 2.000
-DEBUG:  monetdb_fdw bind value[1]: 102.000
-DEBUG:  monetdb_fdw bind value[2]: jane.smith@example.com
-DEBUG:  monetdb_fdw bind value[3]: 2025-02-15
-DEBUG:  monetdb_fdw bind value[4]: 3.000
+DEBUG:  monetdb_fdw batch INSERT: INSERT INTO test_u.orders(order_id, product_id, customer_email, order_date, quantity) VALUES (?, ?, ?, ?, ?)
+DEBUG:  monetdb_fdw batch bind[0]: 2.000
+DEBUG:  monetdb_fdw batch bind[1]: 102.000
+DEBUG:  monetdb_fdw batch bind[2]: jane.smith@example.com
+DEBUG:  monetdb_fdw batch bind[3]: 2025-02-15
+DEBUG:  monetdb_fdw batch bind[4]: 3.000
 DEBUG:  monetdb_fdw: commit remote transaction
 UPDATE orders
 SET quantity = 10
 WHERE order_id = 1 AND product_id = 101;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT order_id, product_id, customer_email, order_date, quantity FROM test_u.orders WHERE ((order_id = 1)) AND ((product_id = 101)) /* FOR UPDATE */
-DEBUG:  monetdb_fdw remote prepare query is: UPDATE test_u.orders SET quantity = ? WHERE order_id = ? AND product_id = ?
-DEBUG:  monetdb_fdw bind value[0]: 10.000
-DEBUG:  monetdb_fdw bind value[1]: 1.000
-DEBUG:  monetdb_fdw bind value[2]: 101.000
 DEBUG:  monetdb_fdw: commit remote transaction
 DELETE FROM orders
 WHERE order_id = 2 AND product_id = 102;
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT order_id, product_id FROM test_u.orders WHERE ((order_id = 2)) AND ((product_id = 102)) /* FOR UPDATE */
-DEBUG:  monetdb_fdw remote prepare query is: DELETE FROM test_u.orders WHERE order_id = ? AND product_id = ?
-DEBUG:  monetdb_fdw bind value[0]: 2.000
-DEBUG:  monetdb_fdw bind value[1]: 102.000
 DEBUG:  monetdb_fdw: commit remote transaction
 SELECT * FROM orders; 
+DEBUG:  pg_monetdb_planner called: cteList_len=0
+DEBUG:  pg_monetdb_try_inline_reused_ctes: parse=non-null cteList_len=0
 DEBUG:  monetdb_fdw: begin remote transaction
-DEBUG:  monetdb_fdw remote query is: SELECT order_id, product_id, customer_email, order_date, quantity FROM test_u.orders
+DEBUG:  BeginForeignScan result col 1: name=order_id type=1700 (numeric)
+DEBUG:  BeginForeignScan result col 2: name=product_id type=1700 (numeric)
+DEBUG:  BeginForeignScan result col 3: name=customer_email type=1043 (character varying)
+DEBUG:  BeginForeignScan result col 4: name=order_date type=1082 (date)
+DEBUG:  BeginForeignScan result col 5: name=quantity type=1700 (numeric)
+DEBUG:  BeginForeignScan scan col 1: name=order_id type=1700 (numeric)
+DEBUG:  BeginForeignScan scan col 2: name=product_id type=1700 (numeric)
+DEBUG:  BeginForeignScan scan col 3: name=customer_email type=1043 (character varying)
+DEBUG:  BeginForeignScan scan col 4: name=order_date type=1082 (date)
+DEBUG:  BeginForeignScan scan col 5: name=quantity type=1700 (numeric)
 DEBUG:  monetdb_fdw: commit remote transaction
  order_id | product_id |    customer_email    | order_date | quantity 
 ----------+------------+----------------------+------------+----------

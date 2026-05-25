@@ -5,7 +5,7 @@ select monetdb_execute('foreign_server', $$CREATE TABLE Numeric_Types(
 	b SMALLINT,
 	c INTEGER,
 	d BIGINT,
-     e HUGEINT,
+  e HUGEINT,
 	f DECIMAL,
 	g NUMERIC(38, 3),
 	h REAL,
@@ -38,7 +38,7 @@ INSERT INTO Numeric_Types(a) VALUES(127);
 INSERT INTO Numeric_Types(a) VALUES(127 + 1);
 ERROR:  value for domain tinyint violates check constraint "tinyint_check"
 SELECT * FROM Numeric_Types;
-     a  | b | c | d | e | f | g | h | i | j 
+  a  | b | c | d | e | f | g | h | i | j 
 -----+---+---+---+---+---+---+---+---+---
  127 |   |   |   |   |   |   |   |   |  
 (1 row)
@@ -52,9 +52,9 @@ INSERT INTO Numeric_Types(b) VALUES(32767);
 INSERT INTO Numeric_Types(b) VALUES(32767 + 1);
 ERROR:  smallint out of range
 SELECT * FROM Numeric_Types;
-a |   b   | c | d | e | f | g | h | i | j 
+ a |   b   | c | d | e | f | g | h | i | j 
 ---+-------+---+---+---+---+---+---+---+---
-     | 32767 |   |   |   |   |   |   |   |  
+   | 32767 |   |   |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -66,9 +66,9 @@ INSERT INTO Numeric_Types(c) VALUES(2147483647);
 INSERT INTO Numeric_Types(c) VALUES(2147483647 + 1);
 ERROR:  integer out of range
 SELECT * FROM Numeric_Types;
-a | b |     c      | d | e | f | g | h | i | j 
+ a | b |     c      | d | e | f | g | h | i | j 
 ---+---+------------+---+---+---+---+---+---+---
-     |   | 2147483647 |   |   |   |   |   |   |  
+   |   | 2147483647 |   |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -80,9 +80,9 @@ INSERT INTO Numeric_Types(d) VALUES(9223372036854775807);
 INSERT INTO Numeric_Types(d) VALUES(9223372036854775807 + 1);
 ERROR:  bigint out of range
 SELECT * FROM Numeric_Types;
-a | b | c |          d          | e | f | g | h | i | j 
+ a | b | c |          d          | e | f | g | h | i | j 
 ---+---+---+---------------------+---+---+---+---+---+---
-     |   |   | 9223372036854775807 |   |   |   |   |   |  
+   |   |   | 9223372036854775807 |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -94,8 +94,8 @@ INSERT INTO Numeric_Types(e) VALUES('170141183460469231731687303715884105727');
 INSERT INTO Numeric_Types(e) VALUES('170141183460469231731687303715884105728');
 ERROR:  value for domain hugeint violates check constraint "hugeint_check"
 SELECT e::text FROM Numeric_Types ORDER BY e;
-                               e                    
-----------------------------------------
+                    e                     
+------------------------------------------
  -170141183460469231731687303715884105727
  170141183460469231731687303715884105727
 (2 rows)
@@ -103,11 +103,10 @@ SELECT e::text FROM Numeric_Types ORDER BY e;
 SELECT count(*) FROM Numeric_Types WHERE e = '170141183460469231731687303715884105727';
  count 
 -------
-       1
+     1
 (1 row)
 
 TRUNCATE Numeric_Types;
-
 select monetdb_execute('foreign_server', $$CREATE TABLE bool_Types(
 	a BOOLEAN
 )$$);
@@ -313,6 +312,84 @@ SELECT monetdb_execute('foreign_server', $$DROP TABLE Time_Types$$);
  
 (1 row)
 
+-- test INTERVAL MONTH, INTERVAL DAY, INTERVAL SECOND via IMPORT FOREIGN SCHEMA
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_month_test(a INTERVAL MONTH)$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_day_test(a INTERVAL DAY)$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_second_test(a INTERVAL SECOND)$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
+IMPORT FOREIGN SCHEMA "test_u" limit to (interval_month_test, interval_day_test, interval_second_test) from server foreign_server into public;
+SELECT c.relname as "Table",
+       a.attname as "Column",
+       format_type(a.atttypid, a.atttypmod) as "Type"
+FROM pg_class c
+JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE c.relname in ('interval_month_test', 'interval_day_test', 'interval_second_test')
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY c.relname, a.attnum;
+        Table         | Column |      Type       
+----------------------+--------+-----------------
+ interval_day_test    | a      | interval day
+ interval_month_test  | a      | interval month
+ interval_second_test | a      | interval second
+(3 rows)
+
+INSERT INTO interval_month_test VALUES (interval '2 months');
+INSERT INTO interval_day_test VALUES (interval '3 days');
+INSERT INTO interval_second_test VALUES (interval '04:05:06');
+SELECT a::text FROM interval_month_test;
+    a     
+----------
+ @ 2 mons
+(1 row)
+
+SELECT a::text FROM interval_day_test;
+    a     
+----------
+ @ 3 days
+(1 row)
+
+SELECT a::text FROM interval_second_test;
+            a            
+-------------------------
+ @ 4 hours 5 mins 6 secs
+(1 row)
+
+DROP FOREIGN TABLE interval_month_test;
+DROP FOREIGN TABLE interval_day_test;
+DROP FOREIGN TABLE interval_second_test;
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_month_test$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_day_test$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_second_test$$);
+ monetdb_execute 
+-----------------
+ 
+(1 row)
+
 -- test JSON
 select monetdb_execute('foreign_server', $$CREATE TABLE json_example (c1 JSON, c2 JSON(512) NOT NULL)$$);
  monetdb_execute 
@@ -494,8 +571,8 @@ WHERE c.relname = 'url_example';
 
 INSERT INTO url_example VALUES('https://github.com/saulojb/pg_monetdb', 'https://github.com/saulojb/pg_monetdb');
 SELECT * FROM URL_example;
-                   c1                    |                   c2                    
------------------------------------------+-----------------------------------------
+                  c1                   |                  c2                   
+---------------------------------------+---------------------------------------
  https://github.com/saulojb/pg_monetdb | https://github.com/saulojb/pg_monetdb
 (1 row)
 

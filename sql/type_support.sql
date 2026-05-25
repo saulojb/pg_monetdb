@@ -191,6 +191,38 @@ SELECT e AT TIME ZONE 'UTC' AS time_with_tz_utc FROM time_types;
 DROP FOREIGN TABLE Time_Types;
 SELECT monetdb_execute('foreign_server', $$DROP TABLE Time_Types$$);
 
+-- test INTERVAL MONTH, INTERVAL DAY, INTERVAL SECOND via IMPORT FOREIGN SCHEMA
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_month_test(a INTERVAL MONTH)$$);
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_day_test(a INTERVAL DAY)$$);
+select monetdb_execute('foreign_server', $$CREATE TABLE interval_second_test(a INTERVAL SECOND)$$);
+
+IMPORT FOREIGN SCHEMA "test_u" limit to (interval_month_test, interval_day_test, interval_second_test) from server foreign_server into public;
+
+SELECT c.relname as "Table",
+       a.attname as "Column",
+       format_type(a.atttypid, a.atttypmod) as "Type"
+FROM pg_class c
+JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE c.relname in ('interval_month_test', 'interval_day_test', 'interval_second_test')
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+ORDER BY c.relname, a.attnum;
+
+INSERT INTO interval_month_test VALUES (interval '2 months');
+INSERT INTO interval_day_test VALUES (interval '3 days');
+INSERT INTO interval_second_test VALUES (interval '04:05:06');
+
+SELECT a::text FROM interval_month_test;
+SELECT a::text FROM interval_day_test;
+SELECT a::text FROM interval_second_test;
+
+DROP FOREIGN TABLE interval_month_test;
+DROP FOREIGN TABLE interval_day_test;
+DROP FOREIGN TABLE interval_second_test;
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_month_test$$);
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_day_test$$);
+SELECT monetdb_execute('foreign_server', $$DROP TABLE interval_second_test$$);
+
 -- test JSON
 select monetdb_execute('foreign_server', $$CREATE TABLE json_example (c1 JSON, c2 JSON(512) NOT NULL)$$);
 IMPORT FOREIGN SCHEMA "test_u" limit to (json_example) from server foreign_server into public;

@@ -106,13 +106,13 @@ make && make install
 | TEXT                         | 支持     | 请参考PostgreSQL官方文档，不支持TEXT(x)这样的使用方式，在执行IMPORT FOREIGN SCHEMA时，原有的TEXT(x)会变成VARCHAR(x) |
 | CLOB                         | 支持     | 本质上是TEXT的DOMAIN，不支持CLOB(x)这样的使用方式，在执行IMPORT FOREIGN SCHEMA时，原有的CLOB(x)会变成VARCHAR(x)     |
 | STRING                       | 支持     | 本质上是TEXT的DOMAIN，不支持STRING(x)这样的使用方式，在执行IMPORT FOREIGN SCHEMA时，原有的STRING(x)会变成VARCHAR(x) |
-| BLOB                         | 暂未支持 |                                                                                                                     |
+| BLOB                         | 支持     | 本质上是 `bytea`；基于 `bytea` 的 DOMAIN（如 `blob`）也受支持                                                       |
 | BOOL                         | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | TINYINT                      | 支持     | 本质上是SMALLINT的DOMAIN，大小范围-127至127                                                                         |
 | SMALLINT                     | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | INTEGER                      | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | BIGINT                       | 支持     | 请参考PostgreSQL官方文档                                                                                            |
-| HUGEINT                      | 暂未支持 | 一个初步的设想是使用另一个PostgreSQL的插件来是实现支持                                                              |
+| HUGEINT                      | 支持     | 映射为 PostgreSQL 上基于 `numeric(39,0)` 的 `HUGEINT` DOMAIN，取值范围为 `-2^127 + 1` 到 `2^127 - 1`            |
 | DECIMAL                      | 支持     | 内部均会转换成NUMERIC，请参考PostgreSQL官方文档                                                                     |
 | REAL                         | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | DOUBLE PRECISION             | 支持     | 请参考PostgreSQL官方文档                                                                                            |
@@ -122,13 +122,27 @@ make && make install
 | TIME WITH TIME ZONE          | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | TIMESTAMP                    | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | TIMESTAMP WITH TIME ZONE     | 支持     | 请参考PostgreSQL官方文档                                                                                            |
-| INTERVAL interval\_qualifier | 待测试   |                                                                                                                     |
+| INTERVAL YEAR                | 支持     | 导入为 PostgreSQL 的 `interval month`，通过 MonetDB 的 month-based interval family 实现 round-trip                  |
+| INTERVAL YEAR TO MONTH       | 支持     | 导入为 PostgreSQL 的 `interval month`，通过 MonetDB 的 month-based interval family 实现 round-trip                  |
+| INTERVAL MONTH               | 支持     | 导入为 PostgreSQL 的 `interval month`，已通过 `IMPORT FOREIGN SCHEMA` 验证 round-trip                               |
+| INTERVAL DAY                 | 支持     | 导入为 PostgreSQL 的 `interval day`，FDW 会在读写两侧归一化 MonetDB 的原始秒数存储                                 |
+| INTERVAL DAY TO HOUR         | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL DAY TO MINUTE       | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL DAY TO SECOND       | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL HOUR                | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL HOUR TO MINUTE      | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL HOUR TO SECOND      | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL MINUTE              | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL MINUTE TO SECOND    | 部分支持 | MonetDB 将其存为 `sec_interval`；导入 PostgreSQL 时会落为 `interval second`，原始 qualifier 不保留                |
+| INTERVAL SECOND              | 支持     | 导入为 PostgreSQL 的 `interval second`，已通过 `IMPORT FOREIGN SCHEMA` 验证 round-trip                              |
 | JSON                         | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | UUID                         | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 | URL                          | 支持     | 本质上是TEXT的DOMAIN                                                                                                |
 | INET                         | 支持     | 请参考PostgreSQL官方文档                                                                                            |
 
 相关类型测试内容详见[type\_support.sql](./sql/type_support.sql)
+
+当前 MonetDB 的 INTERVAL 支持状态如下：远端引擎接受 `INTERVAL MONTH`、`INTERVAL DAY`、`INTERVAL SECOND` 等带 qualifier 的形式，并在元数据中暴露为 `month_interval`、`day_interval`、`sec_interval`。`IMPORT FOREIGN SCHEMA` 会把这些 family 映射为 PostgreSQL 的 `interval month`、`interval day`、`interval second`，而 pg_monetdb 现在已经补齐了这些已导入 family 的写入格式化和读取归一化，因此 month/day/second 这三类可以完成端到端 round-trip。当前剩余限制是 qualifier fidelity：凡是 MonetDB 落到 `sec_interval` 的类型，例如 `INTERVAL DAY TO SECOND`，导入 PostgreSQL 后目前会统一表现为 `interval second`，存储 family 可用，但原始 qualifier 不会被保留。
 
 #### 限制
 
