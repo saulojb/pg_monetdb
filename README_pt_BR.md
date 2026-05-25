@@ -2,6 +2,10 @@
 
 ## pg_monetdb
 
+<p align="center">
+        <img src="docs/images/capa.png" alt="Capa do pg_monetdb" width="960">
+</p>
+
 pg_monetdb e um fork de monetdb_fdw focado em pushdown mais forte para formatos de consultas analiticas derivados de cargas no estilo TPC-H e TPC-DS.
 
 Este fork se apoia nos excelentes projetos oracle_fdw (https://github.com/laurenz/oracle_fdw.git) e postgres_fdw (https://www.postgresql.org/docs/current/postgres-fdw.html).
