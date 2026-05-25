@@ -136,7 +136,7 @@ IMPORT FOREIGN SCHEMA "zm" limit to (emp) from server foreign_server into public
 | SMALLINT                     | Y         | Ref PostgreSQL Doc                                                                                                        |
 | INTEGER                      | Y         | Ref PostgreSQL Doc                                                                                                        |
 | BIGINT                       | Y         | Ref PostgreSQL Doc                                                                                                        |
-| HUGEINT                      | N         | Will support soon                                                                                                         |
+| HUGEINT                      | Y         | Mapped to a PostgreSQL `HUGEINT` domain over `numeric(39,0)` with range `-2^127 + 1` to `2^127 - 1`                  |
 | DECIMAL                      | Y         | NUMERIC                                                                                                                   |
 | REAL                         | Y         | Ref PostgreSQL Doc                                                                                                        |
 | DOUBLE PRECISION             | Y         | Ref PostgreSQL Doc                                                                                                        |

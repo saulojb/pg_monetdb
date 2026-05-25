@@ -2,7 +2,7 @@
   "name": "pg_monetdb",
   "abstract": "Foreign-data wrapper for remote MonetDB databases",
   "description": "pg_monetdb is a PostgreSQL FDW extension for querying and modifying data stored in remote MonetDB servers. The distribution ships the extension control and upgrade scripts, C implementation, and documentation needed to build, install, and use the FDW through PGXS.",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "maintainer": [
     "saulo jose benvenutti <saulojb@gmail.com>"
   ],
@@ -11,9 +11,9 @@
   },
   "provides": {
     "pg_monetdb": {
-      "file": "pg_monetdb--1.3.sql",
+      "file": "pg_monetdb--1.4.sql",
       "docfile": "README.md",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "abstract": "Foreign-data wrapper for remote MonetDB databases"
     }
   },

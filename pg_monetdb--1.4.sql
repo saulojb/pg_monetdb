@@ -1,5 +1,5 @@
 /*
- * pg_monetdb--1.3.sql
+ * pg_monetdb--1.4.sql
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -105,3 +105,9 @@ CREATE DOMAIN STRING AS TEXT;
 CREATE DOMAIN URL AS TEXT;
 
 CREATE DOMAIN BLOB AS BYTEA;
+
+CREATE DOMAIN HUGEINT AS numeric(39,0)
+	CHECK (
+        VALUE >= -170141183460469231731687303715884105727
+		AND VALUE <= 170141183460469231731687303715884105727
+	);

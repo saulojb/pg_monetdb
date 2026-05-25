@@ -125,6 +125,7 @@ static bool foreign_expr_walker(Node *node,
 								foreign_loc_cxt *outer_cxt,
 								foreign_loc_cxt *case_arg_cxt);
 static char *deparse_type_name(Oid type_oid, int32 typemod);
+static char *monetdb_remote_type_name(Oid type_oid, int32 typemod);
 
 /*
  * Functions to construct string representation of a node tree.
@@ -1422,6 +1423,58 @@ deparse_type_name(Oid type_oid, int32 typemod)
 		flags |= FORMAT_TYPE_FORCE_QUALIFY;
 
 	return format_type_extended(type_oid, typemod, flags);
+}
+
+static char *
+monetdb_remote_type_name(Oid type_oid, int32 typemod)
+{
+	HeapTuple	tup;
+	Form_pg_type typeform;
+	char	   *typname;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type_oid);
+
+	typeform = (Form_pg_type) GETSTRUCT(tup);
+	if (typeform->typtype == TYPTYPE_DOMAIN)
+	{
+		typname = NameStr(typeform->typname);
+
+		if (strcmp(typname, "tinyint") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("TINYINT");
+		}
+		if (strcmp(typname, "clob") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("CLOB");
+		}
+		if (strcmp(typname, "string") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("STRING");
+		}
+		if (strcmp(typname, "url") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("URL");
+		}
+		if (strcmp(typname, "blob") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("BLOB");
+		}
+		if (strcmp(typname, "hugeint") == 0)
+		{
+			ReleaseSysCache(tup);
+			return pstrdup("HUGEINT");
+		}
+	}
+
+	ReleaseSysCache(tup);
+	return deparse_type_name(type_oid, typemod);
 }
 
 /*
@@ -5132,7 +5185,7 @@ printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod,
 				 deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	char	   *ptypename = deparse_type_name(paramtype, paramtypmod);
+	char	   *ptypename = monetdb_remote_type_name(paramtype, paramtypmod);
 
 	appendStringInfo(buf, "$%d::%s", paramindex, ptypename);
 }
@@ -5158,7 +5211,7 @@ printRemotePlaceholder(Oid paramtype, int32 paramtypmod,
 					   deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
-	char	   *ptypename = deparse_type_name(paramtype, paramtypmod);
+	char	   *ptypename = monetdb_remote_type_name(paramtype, paramtypmod);
 
 	appendStringInfo(buf, "((SELECT null::%s)::%s)", ptypename, ptypename);
 }

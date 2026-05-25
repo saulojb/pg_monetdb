@@ -5,7 +5,7 @@ select monetdb_execute('foreign_server', $$CREATE TABLE Numeric_Types(
 	b SMALLINT,
 	c INTEGER,
 	d BIGINT,
-	-- e HUGEINT,
+     e HUGEINT,
 	f DECIMAL,
 	g NUMERIC(38, 3),
 	h REAL,
@@ -38,9 +38,9 @@ INSERT INTO Numeric_Types(a) VALUES(127);
 INSERT INTO Numeric_Types(a) VALUES(127 + 1);
 ERROR:  value for domain tinyint violates check constraint "tinyint_check"
 SELECT * FROM Numeric_Types;
-  a  | b | c | d | f | g | h | i | j 
------+---+---+---+---+---+---+---+---
- 127 |   |   |   |   |   |   |   |  
+     a  | b | c | d | e | f | g | h | i | j 
+-----+---+---+---+---+---+---+---+---+---
+ 127 |   |   |   |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -52,9 +52,9 @@ INSERT INTO Numeric_Types(b) VALUES(32767);
 INSERT INTO Numeric_Types(b) VALUES(32767 + 1);
 ERROR:  smallint out of range
 SELECT * FROM Numeric_Types;
- a |   b   | c | d | f | g | h | i | j 
----+-------+---+---+---+---+---+---+---
-   | 32767 |   |   |   |   |   |   |  
+a |   b   | c | d | e | f | g | h | i | j 
+---+-------+---+---+---+---+---+---+---+---
+     | 32767 |   |   |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -66,9 +66,9 @@ INSERT INTO Numeric_Types(c) VALUES(2147483647);
 INSERT INTO Numeric_Types(c) VALUES(2147483647 + 1);
 ERROR:  integer out of range
 SELECT * FROM Numeric_Types;
- a | b |     c      | d | f | g | h | i | j 
----+---+------------+---+---+---+---+---+---
-   |   | 2147483647 |   |   |   |   |   |  
+a | b |     c      | d | e | f | g | h | i | j 
+---+---+------------+---+---+---+---+---+---+---
+     |   | 2147483647 |   |   |   |   |   |   |  
 (1 row)
 
 TRUNCATE Numeric_Types;
@@ -80,10 +80,33 @@ INSERT INTO Numeric_Types(d) VALUES(9223372036854775807);
 INSERT INTO Numeric_Types(d) VALUES(9223372036854775807 + 1);
 ERROR:  bigint out of range
 SELECT * FROM Numeric_Types;
- a | b | c |          d          | f | g | h | i | j 
----+---+---+---------------------+---+---+---+---+---
-   |   |   | 9223372036854775807 |   |   |   |   |  
+a | b | c |          d          | e | f | g | h | i | j 
+---+---+---+---------------------+---+---+---+---+---+---
+     |   |   | 9223372036854775807 |   |   |   |   |   |  
 (1 row)
+
+TRUNCATE Numeric_Types;
+-- test HUGEINT
+INSERT INTO Numeric_Types(e) VALUES('-170141183460469231731687303715884105728');
+ERROR:  value for domain hugeint violates check constraint "hugeint_check"
+INSERT INTO Numeric_Types(e) VALUES('-170141183460469231731687303715884105727');
+INSERT INTO Numeric_Types(e) VALUES('170141183460469231731687303715884105727');
+INSERT INTO Numeric_Types(e) VALUES('170141183460469231731687303715884105728');
+ERROR:  value for domain hugeint violates check constraint "hugeint_check"
+SELECT e::text FROM Numeric_Types ORDER BY e;
+                               e                    
+----------------------------------------
+ -170141183460469231731687303715884105727
+ 170141183460469231731687303715884105727
+(2 rows)
+
+SELECT count(*) FROM Numeric_Types WHERE e = '170141183460469231731687303715884105727';
+ count 
+-------
+       1
+(1 row)
+
+TRUNCATE Numeric_Types;
 
 select monetdb_execute('foreign_server', $$CREATE TABLE bool_Types(
 	a BOOLEAN
