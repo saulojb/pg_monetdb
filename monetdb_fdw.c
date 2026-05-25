@@ -97,6 +97,19 @@ typedef struct PgMonetdbPlannerTraceContext
 	SubLink    *grouped_any_sublink;
 } PgMonetdbPlannerTraceContext;
 
+typedef struct PgMonetdbLateralVarRewriteContext
+{
+	Index		rtindex;
+	AttrNumber	attno;
+	Query	   *subquery;
+	int			replacements;
+} PgMonetdbLateralVarRewriteContext;
+
+typedef struct PgMonetdbOuterRefWalkerContext
+{
+	bool		has_outer_ref;
+} PgMonetdbOuterRefWalkerContext;
+
 typedef struct MonetdbQueryResultState
 {
 	int			current_row;
@@ -151,7 +164,17 @@ static bool pg_monetdb_grouped_subquery_find_anchor(Query *subquery,
 						 Oid *relid_out,
 						 Oid *serverid_out);
 static bool pg_monetdb_fromnode_has_join(Node *node);
+static bool pg_monetdb_fromnode_has_non_inner_join(Node *node);
 static bool pg_monetdb_should_attach_grouped_bridge(PlannerInfo *root);
+static bool pg_monetdb_expr_references_rel(Node *node, Index rtindex);
+static bool pg_monetdb_expr_has_outer_refs(Node *node);
+static bool pg_monetdb_outer_ref_walker(Node *node, void *context);
+static bool pg_monetdb_is_simple_lateral_scalar_aggregate_subquery(RangeTblEntry *rte);
+static Node *pg_monetdb_replace_lateral_var_with_sublink(Node *node, void *context);
+static Node *pg_monetdb_rewrite_lateral_join_node(Query *query, Node *node,
+											 List **extra_quals,
+											 bool allow_pullup);
+static bool pg_monetdb_rewrite_lateral_scalar_joins(Query *query);
 static bool pg_monetdb_is_single_consumer_nested_query(PlannerInfo *root);
 static bool pg_monetdb_is_reused_nested_cte_query(PlannerInfo *root);
 static bool pg_monetdb_is_simple_nested_aggregate_subquery(PlannerInfo *root,
@@ -392,6 +415,10 @@ pg_monetdb_planner(Query *parse, const char *query_string,
 		}
 	}
 
+	if (pg_monetdb_rewrite_lateral_scalar_joins(parse) &&
+		pg_monetdb_enable_planner_hook_debug)
+		pg_monetdb_log_query_shape(parse, "root-rewritten-lateral");
+
 	/*
 	 * Whole-query pushdown: if the query is fully-foreign and has non-recursive
 	 * CTEs that are referenced more than once, send the original WITH query
@@ -493,6 +520,13 @@ pg_monetdb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 {
 	Oid			derived_relid = InvalidOid;
 	bool			grouped_bridge = false;
+
+	if (root != NULL && root->parse != NULL)
+	{
+		if (pg_monetdb_rewrite_lateral_scalar_joins(root->parse) &&
+			pg_monetdb_enable_planner_hook_debug)
+			pg_monetdb_log_query_shape(root->parse, "rel-hook-rewritten-lateral");
+	}
 
 	if (rel != NULL && rte != NULL && rel->fdw_private == NULL &&
 		pg_monetdb_should_attach_grouped_bridge(root) &&
@@ -1098,6 +1132,315 @@ pg_monetdb_fromnode_has_join(Node *node)
 	}
 
 	return false;
+}
+
+static bool
+pg_monetdb_fromnode_has_non_inner_join(Node *node)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *joinexpr = (JoinExpr *) node;
+
+		if (joinexpr->jointype != JOIN_INNER)
+			return true;
+
+		return pg_monetdb_fromnode_has_non_inner_join(joinexpr->larg) ||
+			pg_monetdb_fromnode_has_non_inner_join(joinexpr->rarg);
+	}
+
+	if (IsA(node, FromExpr))
+	{
+		FromExpr   *fromexpr = (FromExpr *) node;
+		ListCell   *lc;
+
+		foreach(lc, fromexpr->fromlist)
+		{
+			if (pg_monetdb_fromnode_has_non_inner_join((Node *) lfirst(lc)))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+pg_monetdb_expr_references_rel(Node *node, Index rtindex)
+{
+	List	   *vars;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+
+	vars = pull_var_clause(node,
+						   PVC_RECURSE_AGGREGATES |
+						   PVC_RECURSE_PLACEHOLDERS);
+
+	foreach(lc, vars)
+	{
+		Var	   *var = lfirst_node(Var, lc);
+
+		if (var->varlevelsup == 0 && var->varno == rtindex)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+pg_monetdb_expr_has_outer_refs(Node *node)
+{
+	PgMonetdbOuterRefWalkerContext context;
+
+	if (node == NULL)
+		return false;
+
+	memset(&context, 0, sizeof(context));
+	pg_monetdb_outer_ref_walker(node, &context);
+	return context.has_outer_ref;
+}
+
+
+static bool
+pg_monetdb_outer_ref_walker(Node *node, void *context)
+
+
+
+{
+	PgMonetdbOuterRefWalkerContext *walker_context =
+		(PgMonetdbOuterRefWalkerContext *) context;
+
+	if (node == NULL || walker_context->has_outer_ref)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var	   *var = (Var *) node;
+
+		if (var->varlevelsup > 0)
+		{
+			walker_context->has_outer_ref = true;
+			return true;
+		}
+	}
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node,
+							 pg_monetdb_outer_ref_walker,
+							 context,
+							 0);
+
+	return expression_tree_walker(node, pg_monetdb_outer_ref_walker, context);
+}
+
+static bool
+pg_monetdb_is_simple_lateral_scalar_aggregate_subquery(RangeTblEntry *rte)
+{
+	Query	   *subquery;
+	ListCell   *lc;
+	int			visible_tles = 0;
+
+	if (rte == NULL || rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+		return false;
+
+	subquery = rte->subquery;
+
+	if (!subquery->hasAggs || subquery->groupClause != NIL ||
+		subquery->groupingSets != NIL || subquery->havingQual != NULL)
+		return false;
+
+	if (subquery->setOperations != NULL || subquery->hasWindowFuncs ||
+		subquery->hasSubLinks || subquery->cteList != NIL ||
+		subquery->distinctClause != NIL || subquery->sortClause != NIL ||
+		subquery->limitOffset != NULL || subquery->limitCount != NULL)
+		return false;
+
+	if (subquery->jointree == NULL || list_length(subquery->jointree->fromlist) != 1)
+		return false;
+
+	foreach(lc, subquery->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (!tle->resjunk)
+			visible_tles++;
+	}
+
+	return visible_tles == 1 &&
+		(pg_monetdb_expr_has_outer_refs((Node *) subquery->targetList) ||
+		 pg_monetdb_expr_has_outer_refs((Node *) subquery->jointree->quals));
+}
+
+static Node *
+pg_monetdb_replace_lateral_var_with_sublink(Node *node, void *context)
+{
+	PgMonetdbLateralVarRewriteContext *rewrite_context =
+		(PgMonetdbLateralVarRewriteContext *) context;
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var	   *var = (Var *) node;
+
+		if (var->varlevelsup == 0 &&
+			var->varno == rewrite_context->rtindex &&
+			var->varattno == rewrite_context->attno)
+		{
+			SubLink    *sublink = makeNode(SubLink);
+
+			sublink->subLinkType = EXPR_SUBLINK;
+			sublink->subLinkId = 0;
+			sublink->testexpr = NULL;
+			sublink->operName = NIL;
+			sublink->subselect = (Node *) copyObject(rewrite_context->subquery);
+			sublink->location = -1;
+
+			rewrite_context->replacements++;
+			return (Node *) sublink;
+		}
+	}
+
+	return expression_tree_mutator(node,
+							  pg_monetdb_replace_lateral_var_with_sublink,
+							  context);
+}
+
+static Node *
+pg_monetdb_rewrite_lateral_join_node(Query *query, Node *node,
+										 List **extra_quals,
+										 bool allow_pullup)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *joinexpr = (JoinExpr *) node;
+
+		joinexpr->larg = pg_monetdb_rewrite_lateral_join_node(query,
+									   joinexpr->larg,
+									   extra_quals,
+									   allow_pullup &&
+									   joinexpr->jointype == JOIN_INNER);
+		joinexpr->rarg = pg_monetdb_rewrite_lateral_join_node(query,
+									   joinexpr->rarg,
+									   extra_quals,
+									   allow_pullup &&
+									   joinexpr->jointype == JOIN_INNER);
+
+		if (allow_pullup && joinexpr->jointype == JOIN_INNER &&
+			IsA(joinexpr->rarg, RangeTblRef) && joinexpr->quals != NULL)
+		{
+			RangeTblRef *subquery_ref = (RangeTblRef *) joinexpr->rarg;
+			RangeTblEntry *rte = rt_fetch(subquery_ref->rtindex, query->rtable);
+
+			if (pg_monetdb_enable_planner_hook_debug)
+				elog(DEBUG1,
+					 "pg_monetdb lateral rewrite probe: rtindex=%d kind=%s lateral=%s simple=%s qual_refs=%s target_refs=%s where_refs=%s",
+					 subquery_ref->rtindex,
+					 pg_monetdb_rtekind_name(rte->rtekind),
+					 rte->lateral ? "true" : "false",
+					 pg_monetdb_is_simple_lateral_scalar_aggregate_subquery(rte) ? "true" : "false",
+					 pg_monetdb_expr_references_rel((Node *) joinexpr->quals,
+									  subquery_ref->rtindex) ? "true" : "false",
+					 pg_monetdb_expr_references_rel((Node *) query->targetList,
+									  subquery_ref->rtindex) ? "true" : "false",
+					 pg_monetdb_expr_references_rel((Node *) query->jointree->quals,
+									  subquery_ref->rtindex) ? "true" : "false");
+
+			if (pg_monetdb_is_simple_lateral_scalar_aggregate_subquery(rte) &&
+				pg_monetdb_expr_references_rel((Node *) joinexpr->quals,
+									 subquery_ref->rtindex) &&
+				!pg_monetdb_expr_references_rel((Node *) query->targetList,
+									  subquery_ref->rtindex) &&
+				!pg_monetdb_expr_references_rel((Node *) query->jointree->quals,
+									  subquery_ref->rtindex))
+			{
+				PgMonetdbLateralVarRewriteContext rewrite_context;
+				Node	   *rewritten_qual;
+
+				rewrite_context.rtindex = subquery_ref->rtindex;
+				rewrite_context.attno = 1;
+				rewrite_context.subquery = rte->subquery;
+				rewrite_context.replacements = 0;
+
+				rewritten_qual = pg_monetdb_replace_lateral_var_with_sublink(
+					(Node *) joinexpr->quals,
+					&rewrite_context);
+
+				if (rewrite_context.replacements == 1 &&
+					!pg_monetdb_expr_references_rel(rewritten_qual,
+									 subquery_ref->rtindex))
+				{
+					if (pg_monetdb_enable_planner_hook_debug)
+						elog(DEBUG1,
+							 "pg_monetdb lateral rewrite applied: rtindex=%d",
+							 subquery_ref->rtindex);
+					*extra_quals = lappend(*extra_quals, rewritten_qual);
+					rte->lateral = false;
+					rte->inFromCl = false;
+					return joinexpr->larg;
+				}
+			}
+		}
+	}
+
+	return node;
+}
+
+static bool
+pg_monetdb_rewrite_lateral_scalar_joins(Query *query)
+{
+	ListCell   *lc;
+	bool		changed = false;
+	List	   *extra_quals = NIL;
+
+	if (query == NULL)
+		return false;
+
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+		changed |= pg_monetdb_rewrite_lateral_scalar_joins(
+			castNode(Query, cte->ctequery));
+	}
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL)
+			changed |= pg_monetdb_rewrite_lateral_scalar_joins(rte->subquery);
+	}
+
+	if (query->commandType != CMD_SELECT || query->jointree == NULL ||
+		!pg_monetdb_fromnode_has_join((Node *) query->jointree) ||
+		pg_monetdb_fromnode_has_non_inner_join((Node *) query->jointree))
+		return changed;
+
+	foreach(lc, query->jointree->fromlist)
+		lfirst(lc) = pg_monetdb_rewrite_lateral_join_node(query,
+									 (Node *) lfirst(lc),
+									 &extra_quals,
+									 true);
+
+	foreach(lc, extra_quals)
+	{
+		query->jointree->quals = (Node *) make_and_qual(query->jointree->quals,
+											   (Node *) lfirst(lc));
+		changed = true;
+	}
+
+	if (extra_quals != NIL)
+		query->hasSubLinks = true;
+
+	return changed;
 }
 
 static bool

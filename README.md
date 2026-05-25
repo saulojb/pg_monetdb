@@ -172,6 +172,61 @@ Typical invocation:
 sudo -n -u postgres psql -X -p 5433 -d monet_test -f sql/grouped_bridge_window_manual.sql
 ```
 
+For `INNER JOIN LATERAL` queries whose lateral subquery is just a scalar correlated aggregate, current pg_monetdb behavior is to keep the outer join local. In that specific pattern, a scalar-correlated `WHERE` rewrite is a safe workaround and can already push down fully. See [lateral_scalar_rewrite_manual.sql](./sql/lateral_scalar_rewrite_manual.sql).
+
+Typical invocation:
+
+```sh
+sudo -n -u postgres psql -X -p 5433 -d monet_test -f sql/lateral_scalar_rewrite_manual.sql
+```
+
+Experimental option:
+
+If the backend session preloads `pg_monetdb` before the first FDW query, the current planner-hook experiment can normalize this exact `INNER JOIN LATERAL` scalar-aggregate pattern automatically and produce the same fully pushed-down plan. One way to test that behavior is:
+
+```sh
+sudo -n -u postgres env PGOPTIONS='-c session_preload_libraries=pg_monetdb' \
+        psql -X -p 5433 -d monet_test -f sql/lateral_scalar_rewrite_manual.sql
+```
+
+This is an experimental workflow for validation on the test branch. Without session preload, the first FDW query in a backend can still miss the rewrite and keep the original `JOIN LATERAL` shape local.
+
+Example rewrite:
+
+```sql
+-- Original INNER JOIN LATERAL form
+SELECT
+        SUM(l.l_extendedprice) / 7.0 AS avg_yearly
+FROM
+        part p
+        JOIN lineitem l ON l.l_partkey = p.p_partkey
+        JOIN LATERAL (
+                SELECT 0.2 * AVG(l2.l_quantity) AS threshold
+                FROM lineitem l2
+                WHERE l2.l_partkey = p.p_partkey
+        ) aq ON l.l_quantity < aq.threshold
+WHERE
+        p.p_brand = 'Brand#23'
+        AND p.p_container = 'MED BOX';
+
+-- Recommended scalar-correlated rewrite for pushdown
+SELECT
+        SUM(l.l_extendedprice) / 7.0 AS avg_yearly
+FROM
+        part p
+        JOIN lineitem l ON l.l_partkey = p.p_partkey
+WHERE
+        p.p_brand = 'Brand#23'
+        AND p.p_container = 'MED BOX'
+        AND l.l_quantity < (
+                SELECT 0.2 * AVG(l2.l_quantity)
+                FROM lineitem l2
+                WHERE l2.l_partkey = p.p_partkey
+        );
+```
+
+This rewrite is recommended only for the `INNER JOIN LATERAL` case where the lateral side returns a single scalar aggregate row correlated on the outer relation and the join predicate only compares outer columns against that scalar result.
+
 #### Limits
 
 Primary Key is required for DELETE and UPDATE operations.

@@ -69,3 +69,10 @@ FROM retidos;
 - Pergunta a responder: para a variante `SUM(receita) FILTER (WHERE mes = 1) AS jan`, podemos deparsing/rewrite para `SUM(CASE WHEN mes = 1 THEN receita ELSE 0 END) AS jan`?
 - Contexto: o shape mensal com grouped bridge ja foi validado no formato atual, mas vale confirmar se a reescrita para `CASE WHEN` ajuda compatibilidade de pushdown, simplifica o SQL remoto ou evita novos cantos de planner/deparser.
 - Guard-rail: qualquer experimento precisa preservar os casos ja validados, em especial o pivot mensal e `sql/grouped_bridge_window_manual.sql`.
+
+### 7. Normalizar `INNER JOIN LATERAL` escalar para forma correlacionada
+
+- Status: adiado; workaround documentado
+- Contexto: a variante `JOIN LATERAL (SELECT 0.2 * AVG(...) ...) aq ON outer_col < aq.threshold` ainda fica local, mas a forma escalar equivalente em `WHERE outer_col < (SELECT 0.2 * AVG(...) ...)` ja pushda como um unico `Foreign Scan`.
+- Estado atual seguro: usar a reescrita documentada em `sql/lateral_scalar_rewrite_manual.sql` e no README para obter pushdown sem mexer em joins parametrizados.
+- Direcao futura: reconhecer planner-side esse padrao especifico de `INNER JOIN LATERAL` escalar e normaliza-lo para a forma correlacionada antes da classificacao entre `remote_conds` e `local_conds`.
