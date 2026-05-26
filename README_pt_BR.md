@@ -88,6 +88,12 @@ Esses artefatos são a referência versionada da matriz de validação cross-ver
 
 Instalação rápida oficial do MonetDB: https://www.monetdb.org/easy-setup/
 
+Em sistemas Debian/Ubuntu, instale antes o pacote de desenvolvimento do cliente MonetDB:
+
+```sh
+apt update && apt install -y libmonetdb-client-dev
+```
+
 Se o MonetDB foi instalado a partir de pacotes padrão da distribuição, um valor comum para `MONETDB_HOME` é:
 
 ```sh
@@ -104,6 +110,13 @@ export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
 git clone https://github.com/saulojb/pg_monetdb.git
 cd pg_monetdb
 make && make install
+```
+
+Se a máquina tiver mais de um cluster ou versão do PostgreSQL instalado, aponte o build explicitamente para o `PG_CONFIG` do PostgreSQL de destino:
+
+```sh
+make PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
+make install PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
 ```
 
 * Build dentro de uma árvore de código-fonte do PostgreSQL

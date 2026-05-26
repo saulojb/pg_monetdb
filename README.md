@@ -88,6 +88,12 @@ Those artifacts are the checked-in reference for the current cross-version valid
 
 MonetDB quick install: https://www.monetdb.org/easy-setup/
 
+On Debian/Ubuntu systems, install the MonetDB client development package before building:
+
+```sh
+apt update && apt install -y libmonetdb-client-dev
+```
+
 If MonetDB was installed from standard distribution packages, a common default is:
 
 ```sh
@@ -104,6 +110,13 @@ export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
 git clone https://github.com/saulojb/pg_monetdb.git
 cd pg_monetdb
 make && make install
+```
+
+If you have multiple PostgreSQL clusters or versions installed, point the build to the target PostgreSQL explicitly:
+
+```sh
+make PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
+make install PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
 ```
 
 * Build in a source tree of PostgreSQL

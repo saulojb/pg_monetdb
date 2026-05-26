@@ -88,6 +88,12 @@ pg_monetdb 是 monetdb_fdw 的一个分支，重点增强了面向 TPC-H 和 TPC
 
 MonetDB 官方快速安装入口：https://www.monetdb.org/easy-setup/
 
+在 Debian/Ubuntu 系统上，构建前请先安装 MonetDB 客户端开发包：
+
+```sh
+apt update && apt install -y libmonetdb-client-dev
+```
+
 如果 MonetDB 是通过发行版默认软件包安装的，`MONETDB_HOME` 的常见取值可以是：
 
 ```sh
@@ -104,6 +110,13 @@ export LD_LIBRARY_PATH=$MONETDB_HOME/lib64:$LD_LIBRARY_PATH
 git clone https://github.com/saulojb/pg_monetdb.git
 cd pg_monetdb
 make && make install
+```
+
+如果系统里安装了多个 PostgreSQL 集群或版本，请显式指定目标 PostgreSQL 的 `PG_CONFIG`：
+
+```sh
+make PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
+make install PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config
 ```
 
 * 在 PostgreSQL 源码树中构建
